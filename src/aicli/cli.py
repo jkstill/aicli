@@ -12,7 +12,11 @@ from .core.executor import Executor
 from .core.executor import PermissionError as ExecPermissionError
 from .core.parser import split_text_and_actions
 from .core.session import Session
-from .core.system_prompt import build_native_tools_system_prompt, build_system_prompt
+from .core.system_prompt import (
+    TOOL_RETRY_NUDGE,
+    build_native_tools_system_prompt,
+    build_system_prompt,
+)
 from .drivers.base import NativeToolCall, ResponseChunk
 from .drivers.registry import get_driver
 from .output.logger import SessionLogger
@@ -171,10 +175,13 @@ def run_turn(
     use_native_tools: bool,
     system_prompt: str,
     max_action_rounds: int = 10,
+    tool_retries: int = 2,
 ) -> None:
     """Execute one user prompt, potentially looping through multiple action rounds."""
     session.add_user(prompt)
     logger.log("user", prompt)
+
+    tool_retry_count = 0
 
     for _round in range(max_action_rounds):
         messages = session.as_ollama_messages()
@@ -191,9 +198,18 @@ def run_turn(
                 req for tc in done_chunk.native_tool_calls
                 if (req := _native_call_to_action_request(tc)) is not None
             ]
-            clean_text = full_text
         else:
-            clean_text, actions = split_text_and_actions(full_text)
+            _, actions = split_text_and_actions(full_text)
+
+        # Native-tools retry: model responded with text but no tool calls.
+        # Inject a nudge and loop without advancing the visible turn.
+        if use_native_tools and not actions and full_text.strip() and tool_retry_count < tool_retries:
+            tool_retry_count += 1
+            renderer.print_info(f"No tool call received — retrying ({tool_retry_count}/{tool_retries})")
+            session.add_assistant(full_text)
+            session.add_tool_result(TOOL_RETRY_NUDGE)
+            logger.log("tool", f"[retry nudge {tool_retry_count}]")
+            continue
 
         session.add_assistant(full_text)
 

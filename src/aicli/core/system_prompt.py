@@ -48,9 +48,26 @@ Rules:
 
 
 NATIVE_TOOLS_HINT = """\
-You have filesystem and shell tools available. Always use them when the user asks you
-to read files, write files, list directories, search for files, or execute commands.
-Do not refuse or explain how to do these things manually — just call the appropriate tool.
+You are operating in a tool-enabled environment with the following tools available:
+  write_file  — create or modify files on the filesystem
+  read_file   — read the contents of a file
+  list_directory — list files in a directory
+  execute     — run a shell command
+  search_files — find files matching a pattern
+
+Rules:
+- When the user asks you to create, write, save, or modify a file, ALWAYS call write_file.
+- When the user asks you to read a file, ALWAYS call read_file.
+- When the user asks you to run a command, ALWAYS call execute.
+- NEVER describe how to do something manually instead of calling the tool.
+- NEVER say you cannot perform file operations — you have the tools to do so.
+- Call the tool immediately. Do not ask for confirmation.
+"""
+
+TOOL_RETRY_NUDGE = """\
+You responded with text but did not call any tool. You have filesystem tools available \
+(write_file, read_file, execute, list_directory, search_files). \
+Please call the appropriate tool now to complete the task. Do not explain — just call it.\
 """
 
 
