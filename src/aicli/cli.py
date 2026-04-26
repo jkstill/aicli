@@ -1,5 +1,6 @@
 """aicli — main entry point. Argument parsing, prompt loop, action dispatch."""
 
+import re
 import signal
 import sys
 from pathlib import Path
@@ -150,6 +151,26 @@ def _native_call_to_action_request(tc: NativeToolCall) -> ActionRequest | None:
     return ActionRequest(action_type=action_type, params=params)
 
 
+_TOOL_TRIGGER_WORDS = frozenset([
+    # filesystem writes
+    "write", "save", "create", "overwrite", "append", "update", "modify", "edit",
+    # filesystem reads
+    "read", "open", "load",
+    # directory operations
+    "list", "find", "search",
+    # execution
+    "run", "execute", "launch",
+    # deletion / movement
+    "delete", "remove", "move", "copy", "rename",
+])
+
+
+def _prompt_implies_tool_use(prompt: str) -> bool:
+    """Return True if the prompt likely requires a filesystem or shell tool call."""
+    words = set(re.findall(r'\b\w+\b', prompt.lower()))
+    return bool(words & _TOOL_TRIGGER_WORDS)
+
+
 def _stream_response(driver, messages: list[dict], system_prompt: str, renderer: Renderer):
     """Stream a response from the driver, writing chunks to renderer.
     Returns (full_text, done_chunk) where done_chunk carries metadata/tool_calls.
@@ -201,9 +222,13 @@ def run_turn(
         else:
             _, actions = split_text_and_actions(full_text)
 
-        # Native-tools retry: model responded with text but no tool calls.
-        # Inject a nudge and loop without advancing the visible turn.
-        if use_native_tools and not actions and full_text.strip() and tool_retry_count < tool_retries:
+        # Native-tools retry: model responded with text but no tool calls,
+        # AND the prompt actually implies a file/shell operation is needed.
+        # Pure informational queries (explain, describe, etc.) correctly return
+        # text-only — suppress the nudge for those to avoid redundant output.
+        if (use_native_tools and not actions and full_text.strip()
+                and tool_retry_count < tool_retries
+                and _prompt_implies_tool_use(prompt)):
             tool_retry_count += 1
             renderer.print_info(f"No tool call received — retrying ({tool_retry_count}/{tool_retries})")
             session.add_assistant(full_text)
