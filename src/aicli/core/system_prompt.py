@@ -62,6 +62,7 @@ Rules:
 - NEVER describe how to do something manually instead of calling the tool.
 - NEVER say you cannot perform file operations — you have the tools to do so.
 - Call the tool immediately. Do not ask for confirmation.
+- For purely informational requests (explaining concepts, answering questions, describing things), respond with text ONLY — do NOT call any tool.
 """
 
 TOOL_RETRY_NUDGE = """\
