@@ -7,7 +7,7 @@ from pathlib import Path
 
 import click
 
-from .config import driver_config, load_config, resolve_api_key
+from .config import driver_config, filter_models, load_config, resolve_api_key
 from .core.actions import ActionRequest, ActionType, WriteMode
 from .core.executor import Executor
 from .core.executor import PermissionError as ExecPermissionError
@@ -19,16 +19,24 @@ from .core.system_prompt import (
     build_system_prompt,
 )
 from .drivers.base import NativeToolCall, ResponseChunk
-from .drivers.registry import get_driver
+from .drivers.registry import get_driver, list_drivers
 from .output.logger import SessionLogger
 from .output.renderer import Renderer
 
 
 def _parse_model(model_str: str) -> tuple[str, str]:
-    """Split 'driver/model-name' into (driver, model). Defaults to ollama."""
+    """Split 'driver/model-name' into (driver, model). Defaults to ollama.
+
+    If the part before the first '/' is not a known driver (e.g. 'batiai' is an
+    Ollama Hub namespace, not a driver), treat the whole string as an Ollama
+    model name.
+    """
     if "/" in model_str:
-        driver, _, model = model_str.partition("/")
-        return driver.lower(), model
+        prefix, _, rest = model_str.partition("/")
+        if prefix.lower() in list_drivers():
+            return prefix.lower(), rest
+        # Unknown prefix — Ollama Hub namespace like batiai/qwen3.6-35b:q3
+        return "ollama", model_str
     return "ollama", model_str
 
 
@@ -203,6 +211,7 @@ def run_turn(
     logger.log("user", prompt)
 
     tool_retry_count = 0
+    actions_ever_executed = False
 
     for _round in range(max_action_rounds):
         messages = session.as_ollama_messages()
@@ -229,7 +238,10 @@ def run_turn(
         # AND the prompt actually implies a file/shell operation is needed.
         # Pure informational queries (explain, describe, etc.) correctly return
         # text-only — suppress the nudge for those to avoid redundant output.
+        # Also suppress if actions have already run this turn — the model is
+        # just confirming completion, not refusing to act.
         if (use_native_tools and not actions and full_text.strip()
+                and not actions_ever_executed
                 and tool_retry_count < tool_retries
                 and _prompt_implies_tool_use(prompt)):
             tool_retry_count += 1
@@ -245,6 +257,7 @@ def run_turn(
             break
 
         # Execute each requested action.
+        actions_ever_executed = True
         result_parts: list[str] = []
         for req in actions:
             summary = _action_summary(req)
@@ -293,7 +306,7 @@ def run_turn(
 @click.option("--no-markdown", "no_markdown", is_flag=True, default=False,
               help="Disable Markdown rendering")
 @click.option("--list-models", "list_models", is_flag=True, default=False,
-              help="List available models for the driver and exit")
+              help="List available models for the driver and exit (model_exclusions patterns applied)")
 @click.option("--api-base", "api_base", default=None, help="Override driver API base URL")
 @click.option("--api-key", "api_key", default=None, help="Override driver API key")
 @click.option("--log-sessions", "log_sessions", is_flag=True, default=False,
@@ -325,7 +338,7 @@ def main(
     driver.configure(effective_base, effective_key, model_name)
 
     if list_models:
-        for name in driver.list_models():
+        for name in filter_models(driver.list_models(), config):
             click.echo(name)
         return
 

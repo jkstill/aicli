@@ -547,6 +547,40 @@ Extracts the `config["drivers"][driver_name]` sub-dict, or `{}` if absent.
 Reads the API key for a driver: first checks `api_key_env` (environment variable
 name), then `api_key` (literal value). Returns `None` if neither is set.
 
+### `filter_models(models, config) → list[str]`
+
+Removes model names that match any pattern in `config["model_exclusions"]`.
+
+```python
+from aicli.config import filter_models, load_config
+
+config = load_config()
+visible = filter_models(driver.list_models(), config)
+```
+
+Patterns use [fnmatch](https://docs.python.org/3/library/fnmatch.html) syntax
+and are matched **case-insensitively** against the full model name string.
+
+Built-in default patterns (from `_DEFAULTS["model_exclusions"]`):
+
+| Pattern | Rationale |
+|---------|-----------|
+| `*embed*` | Embedding models — Ollama returns HTTP 400 on chat requests |
+| `llama3:*` | Original llama3 family — no tool calling, does not follow action protocol |
+
+Users extend the list via `~/.config/aicli/config.yaml`:
+
+```yaml
+model_exclusions:
+  - "*embed*"
+  - "llama3:*"
+  - "llava*"
+  - "gemma3*"
+```
+
+`filter_models()` is called by `cli.main()` when `--list-models` is active.
+It is a pure function and does not modify `config`.
+
 ---
 
 ## Output Layer

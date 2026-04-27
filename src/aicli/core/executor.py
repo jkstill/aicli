@@ -33,6 +33,8 @@ class Executor:
 
     def _resolve_and_check(self, path_str: str, write: bool = False) -> Path:
         """Resolve path and verify it sits inside an allowed directory."""
+        if not path_str:
+            raise PermissionError("Action rejected: path is empty or missing.")
         path = Path(path_str).resolve()
 
         # Reads are always permitted (no directory restriction for reads).

@@ -1,3 +1,5 @@
+LICENSE
+README.md
 pyproject.toml
 src/aicli/__init__.py
 src/aicli/cli.py
@@ -24,6 +26,9 @@ src/aicli/drivers/registry.py
 src/aicli/output/__init__.py
 src/aicli/output/logger.py
 src/aicli/output/renderer.py
+tests/test_cli_utils.py
 tests/test_executor.py
+tests/test_model_filter.py
 tests/test_parser.py
 tests/test_permissions.py
+tests/test_retry.py
