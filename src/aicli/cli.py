@@ -214,13 +214,16 @@ def run_turn(
         logger.log("assistant", full_text)
 
         # Parse actions from the response.
+        # clean_text has tool-call markup stripped; use it for session history so
+        # the model never sees its own <function=...> blocks re-injected as context.
+        clean_text = full_text
         if use_native_tools and done_chunk and done_chunk.native_tool_calls:
             actions = [
                 req for tc in done_chunk.native_tool_calls
                 if (req := _native_call_to_action_request(tc)) is not None
             ]
         else:
-            _, actions = split_text_and_actions(full_text)
+            clean_text, actions = split_text_and_actions(full_text)
 
         # Native-tools retry: model responded with text but no tool calls,
         # AND the prompt actually implies a file/shell operation is needed.
@@ -231,12 +234,12 @@ def run_turn(
                 and _prompt_implies_tool_use(prompt)):
             tool_retry_count += 1
             renderer.print_info(f"No tool call received — retrying ({tool_retry_count}/{tool_retries})")
-            session.add_assistant(full_text)
+            session.add_assistant(clean_text)
             session.add_tool_result(TOOL_RETRY_NUDGE)
             logger.log("tool", f"[retry nudge {tool_retry_count}]")
             continue
 
-        session.add_assistant(full_text)
+        session.add_assistant(clean_text)
 
         if not actions:
             break
