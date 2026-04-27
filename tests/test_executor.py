@@ -179,3 +179,17 @@ def test_search_files_regex(tmp_path, readonly_executor):
     result = readonly_executor.execute(req)
     assert result.success
     assert any("foo_test" in m for m in result.data["matches"])
+
+
+# --- None / empty path guard ---
+
+def test_write_file_none_path_raises(executor_with_tmpdir):
+    req = ActionRequest(ActionType.WRITE_FILE, {"path": None, "content": "x", "mode": WriteMode.OVERWRITE})
+    with pytest.raises(ExecPermissionError, match="path is empty"):
+        executor_with_tmpdir.execute(req)
+
+
+def test_read_file_none_path_raises(readonly_executor):
+    req = ActionRequest(ActionType.READ_FILE, {"path": None})
+    with pytest.raises(ExecPermissionError, match="path is empty"):
+        readonly_executor.execute(req)

@@ -1,6 +1,7 @@
 """Config file loading with defaults. Merges ~/.config/aicli/config.yaml and
 an optional per-project .aicli.yaml into a flat config dict."""
 
+import fnmatch
 import os
 from pathlib import Path
 
@@ -23,6 +24,13 @@ _DEFAULTS = {
         "claude": {"api_key_env": "ANTHROPIC_API_KEY"},
         "openai": {"api_key_env": "OPENAI_API_KEY"},
     },
+    # fnmatch patterns for models to hide from --list-models.
+    # Patterns are matched case-insensitively against the full model name.
+    # Add entries in ~/.config/aicli/config.yaml or .aicli.yaml to extend.
+    "model_exclusions": [
+        "*embed*",   # embedding models — not usable as chat models
+        "llama3:*",  # original llama3 — no tool calling support
+    ],
 }
 
 _GLOBAL_CONFIG = Path("~/.config/aicli/config.yaml").expanduser()
@@ -66,3 +74,21 @@ def resolve_api_key(driver_cfg: dict) -> str | None:
     if env_var:
         return os.environ.get(env_var)
     return driver_cfg.get("api_key")
+
+
+def filter_models(models: list[str], config: dict) -> list[str]:
+    """Remove models matching any pattern in config['model_exclusions'].
+
+    Patterns use fnmatch syntax and are matched case-insensitively.
+    Example patterns: '*embed*', 'llama3:*', 'mxbai*'.
+    """
+    patterns: list[str] = config.get("model_exclusions", [])
+    if not patterns:
+        return models
+
+    result = []
+    for name in models:
+        lower = name.lower()
+        if not any(fnmatch.fnmatch(lower, p.lower()) for p in patterns):
+            result.append(name)
+    return result

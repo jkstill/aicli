@@ -4,6 +4,7 @@ import pytest
 from aicli.core.parser import (
     parse_action_blocks,
     parse_function_call_blocks,
+    parse_json_tool_call_blocks,
     split_text_and_actions,
 )
 from aicli.core.actions import ActionType, WriteMode
@@ -226,3 +227,90 @@ def test_parse_function_call_missing_required_skipped():
     text = "<function=write_file><parameter=filepath>/tmp/x.txt</parameter></function>"
     actions = list(parse_function_call_blocks(text))
     assert len(actions) == 0
+
+
+# --- JSON code block format (qwen2.5, llama3.2, etc.) ---
+
+_JSON_WRITE = '''\
+Some preamble text.
+```json
+{"name": "write_file", "arguments": {"file_path": "/tmp/out.md", "content": "# Hello"}}
+```
+'''
+
+_JSON_WRITE_PARAMS_KEY = '''\
+```json
+{"name": "write_file", "parameters": {"file_path": "/tmp/out2.md", "content": "# World"}}
+```
+'''
+
+_JSON_READ = '''\
+```json
+{"name": "read_file", "arguments": {"file_path": "/tmp/out.md"}}
+```
+'''
+
+_JSON_EXECUTE = '''\
+```json
+{"name": "execute", "arguments": {"cmd": "ls /tmp"}}
+```
+'''
+
+_JSON_UNKNOWN = '''\
+```json
+{"name": "fly_to_moon", "arguments": {"dest": "Luna"}}
+```
+'''
+
+_JSON_MISSING_CONTENT = '''\
+```json
+{"name": "write_file", "arguments": {"file_path": "/tmp/x.txt"}}
+```
+'''
+
+
+def test_parse_json_tool_call_write_arguments():
+    actions = list(parse_json_tool_call_blocks(_JSON_WRITE))
+    assert len(actions) == 1
+    a = actions[0]
+    assert a.action_type == ActionType.WRITE_FILE
+    assert a.get("path") == "/tmp/out.md"
+    assert a.get("content") == "# Hello"
+    assert a.get("mode") == WriteMode.OVERWRITE
+
+
+def test_parse_json_tool_call_write_parameters_key():
+    actions = list(parse_json_tool_call_blocks(_JSON_WRITE_PARAMS_KEY))
+    assert len(actions) == 1
+    assert actions[0].get("path") == "/tmp/out2.md"
+
+
+def test_parse_json_tool_call_read():
+    actions = list(parse_json_tool_call_blocks(_JSON_READ))
+    assert len(actions) == 1
+    assert actions[0].action_type == ActionType.READ_FILE
+    assert actions[0].get("path") == "/tmp/out.md"
+
+
+def test_parse_json_tool_call_execute_alias():
+    actions = list(parse_json_tool_call_blocks(_JSON_EXECUTE))
+    assert len(actions) == 1
+    assert actions[0].action_type == ActionType.EXECUTE
+    assert actions[0].get("command") == "ls /tmp"
+
+
+def test_parse_json_tool_call_unknown_skipped():
+    actions = list(parse_json_tool_call_blocks(_JSON_UNKNOWN))
+    assert len(actions) == 0
+
+
+def test_parse_json_tool_call_missing_required_skipped():
+    actions = list(parse_json_tool_call_blocks(_JSON_MISSING_CONTENT))
+    assert len(actions) == 0
+
+
+def test_split_removes_json_tool_call_blocks():
+    clean, actions = split_text_and_actions(_JSON_WRITE)
+    assert len(actions) == 1
+    assert "```" not in clean
+    assert "Some preamble text." in clean

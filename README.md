@@ -32,6 +32,7 @@ Architecture (DBI/DBD pattern):
 - [Input Modes](#input-modes)
 - [CLI Reference](#cli-reference)
 - [Configuration](#configuration)
+  - [Model Exclusions](#model-exclusions)
 - [Permission Model](#permission-model)
 - [Action Types](#action-types)
 - [Model Selection](#model-selection)
@@ -192,12 +193,11 @@ aicli loads configuration from two files, merged in order (later wins):
 ```yaml
 # ~/.config/aicli/config.yaml
 
-defaults:
-  model: ollama/glm-4.7-flash:latest
-  output_format: markdown        # markdown | plain
-  confirm_actions: true
-  log_sessions: false
-  log_dir: ~/.local/share/aicli/logs
+model: ollama/glm-4.7-flash:latest
+output_format: markdown        # markdown | plain
+confirm_actions: true
+log_sessions: false
+log_dir: ~/.local/share/aicli/logs
 
 drivers:
   ollama:
@@ -208,6 +208,12 @@ drivers:
     api_key_env: ANTHROPIC_API_KEY
   openai:
     api_key_env: OPENAI_API_KEY
+
+# Models hidden from --list-models (fnmatch patterns, case-insensitive).
+# Add entries here for any model you have tested and found incompatible.
+model_exclusions:
+  - "*embed*"    # embedding models — not usable as chat models
+  - "llama3:*"   # original llama3 — no tool calling support
 ```
 
 ### Per-project override
@@ -226,6 +232,39 @@ drivers:
 
 Any key in `.aicli.yaml` overrides the global config. Missing keys fall back to
 the global config, then to built-in defaults.
+
+### Model exclusions
+
+The `model_exclusions` key holds a list of [fnmatch](https://docs.python.org/3/library/fnmatch.html)
+patterns applied when `--list-models` is run. Models whose names match any
+pattern are hidden from the listing. Patterns are case-insensitive.
+
+Built-in defaults (always active unless overridden):
+
+| Pattern | What it hides |
+|---------|---------------|
+| `*embed*` | Any model with "embed" in its name (embedding models) |
+| `llama3:*` | The original `llama3` family (no tool calling support) |
+
+To extend the exclusion list, add entries in `~/.config/aicli/config.yaml`.
+The lists are **merged**, not replaced — built-in defaults remain active
+unless you redefine the entire `model_exclusions` key:
+
+```yaml
+# ~/.config/aicli/config.yaml
+model_exclusions:
+  - "*embed*"        # keep built-in defaults
+  - "llama3:*"
+  - "llava*"         # multimodal-only, no text tool calling
+  - "gemma3*"        # does not follow aicli action protocol
+  - "llama3.2:*"     # invents wrong tool schema
+```
+
+To disable all filtering and see every model, set an empty list:
+
+```yaml
+model_exclusions: []
+```
 
 ---
 
@@ -351,12 +390,18 @@ verbatim to the driver as the model identifier.
 ### Listing available models
 
 ```bash
-# List all models available on the configured Ollama server
+# List models available on the configured Ollama server (exclusions applied)
 aicli --model ollama --list-models
 
-# Or with a specific host
+# Point at a specific host
 aicli --model ollama --list-models --api-base http://lestrade:11434
 ```
+
+Models matching any pattern in `model_exclusions` (see [Configuration](#configuration))
+are hidden from this listing. This keeps the list focused on models that are
+actually usable for chat and agentic tasks. To see all models regardless of
+exclusions, temporarily set `model_exclusions: []` in your config or a local
+`.aicli.yaml`.
 
 ---
 
@@ -376,20 +421,28 @@ RLHF-trained refusals on file operations in the qwen3/glm4 families.
 
 ### Tested models on Ollama (host: lestrade:11434)
 
-| Model | Tool support | Agentic file ops | Notes |
-|-------|-------------|-----------------|-------|
-| `glm-4.7-flash:latest` | Native (tools) | Excellent | **Recommended default.** Consistent, uses correct write_file params. |
-| `glm-4.7-flash:q4_K_M` | Native (tools) | Excellent | Quantised variant; same behaviour. |
-| `batiai/qwen3.6-35b:q3` | Native (tools) | Good | Uses `execute` (shell redirect) for file writes. Requires `--allow-exec`. |
-| `qwen3-coder:30b` | Native (tools) | Poor | RLHF refusal overrides tool calls for file operations. |
-| `qwen3.5:latest` / `qwen3.5:9b` | Native (tools) | Poor | Same refusal problem as qwen3-coder. |
-| `qwen2.5-coder:14b` | Native (tools) | Poor | Refuses file ops despite tool availability. |
-| `llama3:latest` | None | N/A | Text-only; system prompt fallback. No file ops. |
-| `gemma3:12b` | None | N/A | Text-only; system prompt fallback. No file ops. |
+| Model | Tool support | Agentic file ops | Default excluded | Notes |
+|-------|-------------|-----------------|:---:|-------|
+| `glm-4.7-flash:latest` | Native (tools) | Excellent | | **Recommended default.** Consistent, correct write_file params. |
+| `glm-4.7-flash:q4_K_M` | Native (tools) | Excellent | | Quantised variant; same behaviour. |
+| `batiai/qwen3.6-35b:q3` | Native (tools) | Good | | Uses `execute` (shell redirect) for file writes. Requires `--allow-exec`. |
+| `qwen3-coder:30b` | Native (tools) | Good | | Text-mode `<function=...>` fallback parsed automatically. |
+| `qwen3.5:latest` | Native (tools) | Good | | May retry; file is written correctly on retry. |
+| `qwen3.5:9b` | Native (tools) | Fair | | Occasional empty-path tool call on retry; handled gracefully. |
+| `qwen2.5:14b` | Native (tools) | Fair | | Emits JSON code block format; parsed automatically. |
+| `qwen2.5-coder:14b` | Native (tools) | Fair | | Retries needed; works after nudge. |
+| `llama3.2:latest` | Native (tools) | Poor | | Invents non-standard tool schema; rarely writes files. |
+| `llama3:latest` | None | None | ✓ | No native tools; does not emit action blocks. |
+| `gemma3:12b` | None | None | | No native tools; responds with text only. |
+| `llava:7b` | None | None | | Multimodal model; no tool calling support. |
+| `mxbai-embed-large:latest` | N/A | N/A | ✓ | Embedding model; Ollama returns HTTP 400 on chat requests. |
 
-**Summary:** For agentic file work, use `glm-4.7-flash:latest`. For large-context
-code generation or analysis without file I/O, `qwen3-coder:30b` and
-`batiai/qwen3.6-35b:q3` are strong choices with `--allow-exec`.
+**`✓ Default excluded`** — hidden from `--list-models` by the built-in `model_exclusions`
+patterns. Add others via your config as you discover them.
+
+**Summary:** For reliable agentic file work use `glm-4.7-flash:latest`. For
+large-context code tasks without file I/O, `batiai/qwen3.6-35b:q3` and
+`qwen3-coder:30b` are strong choices with `--allow-exec`.
 
 ---
 
@@ -509,9 +562,12 @@ not full agentic round-trips. They run in about 10 seconds.
 
 | File | Tests | Requires Ollama |
 |------|-------|----------------|
-| `tests/test_parser.py` | 9 — action block XML parsing | No |
-| `tests/test_executor.py` | 14 — file read/write/exec/search + permissions | No |
+| `tests/test_parser.py` | 22 — XML action blocks, `<function=...>` blocks, JSON code blocks | No |
+| `tests/test_executor.py` | 16 — file read/write/exec/search, permissions, None-path guard | No |
 | `tests/test_permissions.py` | 4 — symlink traversal, path traversal, multi-dir | No |
+| `tests/test_retry.py` | 19 — retry nudge content, `_prompt_implies_tool_use` | No |
+| `tests/test_model_filter.py` | 7 — `filter_models()`, fnmatch patterns, case-insensitivity | No |
+| `tests/test_cli_utils.py` | 3 — `_parse_model()`, Ollama namespace prefix handling | No |
 | `tests/test_drivers/test_ollama.py` | 4 — model list, streaming, system prompt | Yes |
 
 ---
@@ -545,9 +601,12 @@ aicli/
 │           ├── renderer.py     # Streaming output + rich Markdown rendering
 │           └── logger.py       # Session file logging
 └── tests/
-    ├── test_parser.py
-    ├── test_executor.py
-    ├── test_permissions.py
+    ├── test_parser.py          # XML, <function=...>, and JSON code block parsers
+    ├── test_executor.py        # file ops, permissions, None-path guard
+    ├── test_permissions.py     # symlink/traversal enforcement
+    ├── test_retry.py           # retry nudge logic
+    ├── test_model_filter.py    # model_exclusions fnmatch filtering
+    ├── test_cli_utils.py       # _parse_model(), Ollama namespace handling
     └── test_drivers/
         └── test_ollama.py
 ```

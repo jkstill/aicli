@@ -6,6 +6,7 @@ format emitted by some models (e.g. qwen3-coder) when native tool calling
 silently falls back to text output.
 """
 
+import json
 import re
 from typing import Generator
 
@@ -19,6 +20,9 @@ _ACTION_RE = re.compile(
 
 # Matches CONTENT heredoc inside write_file blocks.
 _HEREDOC_RE = re.compile(r"<<<CONTENT\n(.*?)\nCONTENT>>>", re.DOTALL)
+
+# JSON code block: {"name": "write_file", "arguments": {...}} (llama3.2, qwen2.5, etc.)
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", re.DOTALL)
 
 # <function=name>...</function> format (some Qwen-family models).
 _FUNC_BLOCK_RE = re.compile(
@@ -154,63 +158,98 @@ def parse_action_blocks(text: str) -> Generator[ActionRequest, None, None]:
         yield ActionRequest(action_type=action_type, params=params)
 
 
+def _action_request_from_raw(func_name: str, raw: dict[str, str]) -> "ActionRequest | None":
+    """Build an ActionRequest from a normalised param dict, or None if required params are missing."""
+    action_type = _FUNC_NAME_MAP.get(func_name)
+    if action_type is None:
+        return None
+
+    params: dict = {}
+    match action_type:
+        case ActionType.WRITE_FILE:
+            if "path" not in raw or "content" not in raw:
+                return None
+            raw_mode = raw.get("mode", "overwrite")
+            try:
+                mode = WriteMode(raw_mode)
+            except ValueError:
+                mode = WriteMode.OVERWRITE
+            params = {"path": raw["path"], "content": raw["content"], "mode": mode}
+
+        case ActionType.READ_FILE:
+            if "path" not in raw:
+                return None
+            params = {"path": raw["path"]}
+
+        case ActionType.LIST_DIRECTORY:
+            if "path" not in raw:
+                return None
+            params = {"path": raw["path"], "recursive": _coerce_bool(raw.get("recursive", "false"))}
+
+        case ActionType.EXECUTE:
+            if "command" not in raw:
+                return None
+            timeout_raw = raw.get("timeout", "30")
+            try:
+                timeout = int(timeout_raw)
+            except ValueError:
+                timeout = 30
+            params = {
+                "command": raw["command"],
+                "working_dir": raw.get("working_dir") or None,
+                "timeout": timeout,
+            }
+
+        case ActionType.SEARCH_FILES:
+            if "pattern" not in raw or "path" not in raw:
+                return None
+            params = {"pattern": raw["pattern"], "path": raw["path"], "type": raw.get("type", "glob")}
+
+        case _:
+            return None
+
+    return ActionRequest(action_type=action_type, params=params)
+
+
 def parse_function_call_blocks(text: str) -> Generator[ActionRequest, None, None]:
     """Yield ActionRequests from <function=name><parameter=key>val</parameter></function> blocks."""
     for match in _FUNC_BLOCK_RE.finditer(text):
         func_name = match.group(1).lower()
         body = match.group(2)
 
-        action_type = _FUNC_NAME_MAP.get(func_name)
-        if action_type is None:
-            continue
-
         raw: dict[str, str] = {}
         for pm in _PARAM_BLOCK_RE.finditer(body):
             key = _FUNC_CALL_ALIASES.get(pm.group(1).strip(), pm.group(1).strip())
             raw[key] = pm.group(2).strip()
 
-        params: dict = {}
-        match action_type:
-            case ActionType.WRITE_FILE:
-                if "path" not in raw or "content" not in raw:
-                    continue
-                raw_mode = raw.get("mode", "overwrite")
-                try:
-                    mode = WriteMode(raw_mode)
-                except ValueError:
-                    mode = WriteMode.OVERWRITE
-                params = {"path": raw["path"], "content": raw["content"], "mode": mode}
+        req = _action_request_from_raw(func_name, raw)
+        if req is not None:
+            yield req
 
-            case ActionType.READ_FILE:
-                if "path" not in raw:
-                    continue
-                params = {"path": raw["path"]}
 
-            case ActionType.LIST_DIRECTORY:
-                if "path" not in raw:
-                    continue
-                params = {"path": raw["path"], "recursive": _coerce_bool(raw.get("recursive", "false"))}
+def parse_json_tool_call_blocks(text: str) -> Generator[ActionRequest, None, None]:
+    """Yield ActionRequests from JSON code blocks like {"name": "write_file", "arguments": {...}}."""
+    for match in _JSON_BLOCK_RE.finditer(text):
+        try:
+            obj = json.loads(match.group(1))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
 
-            case ActionType.EXECUTE:
-                if "command" not in raw:
-                    continue
-                timeout_raw = raw.get("timeout", "30")
-                try:
-                    timeout = int(timeout_raw)
-                except ValueError:
-                    timeout = 30
-                params = {
-                    "command": raw["command"],
-                    "working_dir": raw.get("working_dir") or None,
-                    "timeout": timeout,
-                }
+        func_name = str(obj.get("name", "")).lower()
+        args = obj.get("arguments") or obj.get("parameters") or {}
+        if not isinstance(args, dict):
+            continue
 
-            case ActionType.SEARCH_FILES:
-                if "pattern" not in raw or "path" not in raw:
-                    continue
-                params = {"pattern": raw["pattern"], "path": raw["path"], "type": raw.get("type", "glob")}
+        raw = {
+            _FUNC_CALL_ALIASES.get(k, k): str(v) if not isinstance(v, str) else v
+            for k, v in args.items()
+        }
 
-        yield ActionRequest(action_type=action_type, params=params)
+        req = _action_request_from_raw(func_name, raw)
+        if req is not None:
+            yield req
 
 
 def split_text_and_actions(text: str) -> tuple[str, list[ActionRequest]]:
@@ -223,6 +262,12 @@ def split_text_and_actions(text: str) -> tuple[str, list[ActionRequest]]:
     if func_actions:
         actions.extend(func_actions)
         clean = _FUNC_BLOCK_RE.sub("", clean)
+
+    # Also handle JSON code blocks: {"name": "write_file", "arguments": {...}}.
+    json_actions = list(parse_json_tool_call_blocks(clean))
+    if json_actions:
+        actions.extend(json_actions)
+        clean = _JSON_BLOCK_RE.sub("", clean)
 
     # Always strip stray <tool_call>/</ tool_call> tags some models append.
     clean = re.sub(r"</?\s*tool_call\s*>", "", clean, flags=re.IGNORECASE).strip()
