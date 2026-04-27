@@ -43,7 +43,7 @@ This model create a good response, and exited when finished.
 
 ## glm-4.7-flash:q4_K_M
 
-This model create an execellent response, and exited when finished.
+This model create an excellent response, and exited when finished.
 
 ## qwen2.5:14b
 
