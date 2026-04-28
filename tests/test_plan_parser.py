@@ -226,6 +226,56 @@ def test_space_separator_instead_of_colon():
     assert steps[0].keyword == "READFILE"
 
 
+def test_markdown_dash_bullet_prefix():
+    """llama3.2-style '- KEYWORD arg' format."""
+    plan = (
+        "- READFILE /tmp/a.txt\n"
+        "- PROMPT Analyze it\n"
+        "- WRITEFILE /tmp/out.md\n"
+        "result\n"
+    )
+    steps = parse_plan(plan)
+    assert len(steps) == 3
+    assert steps[0].keyword == "READFILE"
+    assert steps[1].keyword == "PROMPT"
+    assert steps[2].keyword == "WRITEFILE"
+
+
+def test_markdown_star_bullet_prefix():
+    plan = "* EXEC echo hello\n* WRITEFILE /tmp/out.md\nhello\n"
+    steps = parse_plan(plan)
+    assert len(steps) == 2
+    assert steps[0].keyword == "EXEC"
+    assert steps[1].keyword == "WRITEFILE"
+
+
+def test_gencode_path_as_arg():
+    """Models often emit 'GENCODE: /path/to/file.py' — path should become save_path."""
+    steps = parse_plan("GENCODE: /tmp/script.py\nWrite a hello world script.")
+    assert len(steps) == 1
+    assert steps[0].save_path == "/tmp/script.py"
+    assert steps[0].keyword == "GENCODE"
+
+
+def test_gencode_path_as_arg_language_from_extension():
+    """Language should be inferred from the file extension when path is used as arg."""
+    steps = parse_plan("GENCODE: /tmp/chart.gp\nPlot data.")
+    assert steps[0].save_path == "/tmp/chart.gp"
+    assert steps[0].arg == "gp"
+
+
+def test_gencode_path_as_arg_md_extension():
+    steps = parse_plan("GENCODE: /tmp/report.md\nWrite a report.")
+    assert steps[0].save_path == "/tmp/report.md"
+    assert steps[0].arg == "md"
+
+
+def test_gencode_path_as_arg_no_extension():
+    steps = parse_plan("GENCODE: /tmp/Makefile\nWrite a Makefile.")
+    assert steps[0].save_path == "/tmp/Makefile"
+    assert steps[0].arg == "text"
+
+
 # ---------------------------------------------------------------------------
 # Step numbering
 # ---------------------------------------------------------------------------

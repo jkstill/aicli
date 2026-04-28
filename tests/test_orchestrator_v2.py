@@ -189,6 +189,38 @@ def test_exec_nonzero_exit_marks_failure(tmp_path):
     orch.run(steps)  # Step fails (exit_code != 0) but on_error=continue
 
 
+def test_exec_nonzero_error_not_empty(tmp_path):
+    """Non-zero exit should produce a non-empty error message (not just '✗ ')."""
+    errors = []
+
+    class CapturingRenderer:
+        def print_info(self, t): pass
+        def print_warning(self, t): pass
+        def print_error(self, t): errors.append(t)
+        def confirm(self, t): return True
+        def stream_chunk(self, t): pass
+        def finalize(self): pass
+
+    from aicli.core.orchestrator import Orchestrator
+    orch = Orchestrator(
+        analysis_driver=MockDriver(),
+        allowed_dirs=[str(tmp_path)],
+        allow_exec=True,
+        auto_approve=True,
+        dry_run=False,
+        verbose=False,
+        renderer=CapturingRenderer(),
+        exec_timeout=5,
+        on_error="continue",
+    )
+    steps = [_step(1, "EXEC", "exit 42")]
+    orch.run(steps)
+    # There should be an error message and it should not be blank
+    step_errors = [e for e in errors if "✗" in e]
+    assert step_errors, "Expected at least one ✗ error line"
+    assert any(e.strip() != "✗" for e in step_errors), "Error message should not be empty"
+
+
 # ---------------------------------------------------------------------------
 # PROMPT
 # ---------------------------------------------------------------------------

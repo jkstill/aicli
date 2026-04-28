@@ -14,11 +14,12 @@ from dataclasses import dataclass
 
 KEYWORDS = frozenset(["READFILE", "WRITEFILE", "LISTDIR", "EXEC", "PROMPT", "GENCODE"])
 
-# Match: optional "Step N:" / "N." / "N)" bullet, then KEYWORD: rest
+# Match: optional "Step N:" / "N." / "N)" bullet / "- " list marker, then KEYWORD: rest
 _STEP_RE = re.compile(
     r"^\s*"
     r"(?:step\s*\d+\s*[.:)]\s*)?"   # optional "Step N:" prefix
     r"(?:\d+\s*[.)]\s*)?"            # optional "1." or "1)" bullet
+    r"(?:[-*]\s+)?"                  # optional "- " or "* " markdown list marker
     r"(" + "|".join(KEYWORDS) + r")"
     r"\s*[: ]\s*(.*)",
     re.IGNORECASE,
@@ -141,6 +142,17 @@ def _make_step(number: int, keyword: str, arg: str, body_lines: list[str]) -> Pl
                 m = _OUT_RE.search(arg)
                 if m:
                     save_path = m.group(1).strip()
+            # Fallback: if arg itself looks like a file path, treat it as save_path.
+            # Models commonly emit "GENCODE: /path/to/file.md" instead of
+            # "GENCODE: markdown\nSAVEAS: /path/to/file.md".
+            if not save_path:
+                a = arg.strip()
+                if a.startswith("/") or a.startswith("~"):
+                    save_path = a
+                    # Infer language from file extension (e.g. ".py" → "python" extension,
+                    # ".md" → "markdown"); fall back to "text".
+                    ext = a.rsplit(".", 1)[-1] if "." in a else ""
+                    arg = ext if (ext and len(ext) <= 12) else "text"
 
     return PlanStep(number=number, keyword=keyword, arg=arg, body=body, save_path=save_path)
 

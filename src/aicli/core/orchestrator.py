@@ -174,12 +174,13 @@ class Orchestrator:
             stdout = result.data.get("stdout", "")
             stderr = result.data.get("stderr", "")
             exit_code = result.data.get("exit_code", 0)
-            output = stdout
+            combined = stdout
             if stderr:
-                output += f"\n[stderr]: {stderr}"
-            if exit_code != 0:
-                output += f"\n[exit code: {exit_code}]"
-            return StepResult(success=(exit_code == 0), output=output)
+                combined += f"\n[stderr]: {stderr}"
+            if exit_code == 0:
+                return StepResult(success=True, output=combined)
+            err = stderr.strip() or stdout.strip() or f"exit code {exit_code}"
+            return StepResult(success=False, error=f"Command failed ({err})", output=combined)
         return StepResult(success=False, error=result.error or "Execution failed.")
 
     def _exec_prompt(self, step: PlanStep, store: ResultStore) -> StepResult:
