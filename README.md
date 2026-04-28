@@ -1,5 +1,15 @@
 # aicli v2 — Universal Agentic CLI for Large Language Models
 
+Disclaimer: 
+
+At the time of this writing, open weight models such as those available on Ollama are not yet capable of reliably following the step-based plan format required by aicli v2. 
+
+The planner/executor architecture is designed to be robust even with smaller models, but the quality of the generated plans can vary significantly. 
+
+Or, there may be no plan at all. This is a limitation of the current state of open models, not the framework itself.
+
+I will check the capabilities of new models with this toolkit in 12 months, to see if the models have improved to the point where they can be used effectively with aicli v2.
+
 aicli is a command-line tool that gives any LLM agentic capabilities: reading files,
 writing files, listing directories, executing shell commands, and generating code.
 Switch between Ollama (local), Gemini, Claude, or OpenAI with a single flag. Your
