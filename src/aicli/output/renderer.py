@@ -5,9 +5,12 @@ import sys
 try:
     from rich.console import Console
     from rich.markdown import Markdown
+    from rich.markup import escape as _escape
     _RICH = True
 except ImportError:
     _RICH = False
+    def _escape(text: str) -> str:  # type: ignore[misc]
+        return text
 
 
 class Renderer:
@@ -36,19 +39,19 @@ class Renderer:
 
     def print_info(self, text: str) -> None:
         if self.markdown:
-            self._console.print(f"[dim]{text}[/dim]")
+            self._console.print(f"[dim]{_escape(text)}[/dim]")
         else:
             print(text, file=sys.stderr)
 
     def print_warning(self, text: str) -> None:
         if self.markdown:
-            self._console.print(f"[yellow]{text}[/yellow]")
+            self._console.print(f"[yellow]{_escape(text)}[/yellow]")
         else:
             print(f"WARNING: {text}", file=sys.stderr)
 
     def print_error(self, text: str) -> None:
         if self.markdown:
-            self._console.print(f"[red bold]{text}[/red bold]")
+            self._console.print(f"[red bold]{_escape(text)}[/red bold]")
         else:
             print(f"ERROR: {text}", file=sys.stderr)
 
@@ -77,3 +80,24 @@ class Renderer:
             return answer in ("", "y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
+
+    # ------------------------------------------------------------------
+    # V2 planner/executor display
+    # ------------------------------------------------------------------
+
+    def print_plan(self, steps: list) -> None:
+        """Display the parsed plan before execution."""
+        header = f"Plan: {len(steps)} step(s)"
+        if self.markdown:
+            self._console.print(f"\n[bold cyan]{header}[/bold cyan]")
+            for step in steps:
+                save = f" → {_escape(step.save_path)}" if step.save_path else ""
+                self._console.print(
+                    f"  [dim]{step.number:2}.[/dim] "
+                    f"[cyan]{step.keyword}[/cyan]: {_escape(step.arg[:70])}{save}"
+                )
+        else:
+            print(f"\n{header}")
+            for step in steps:
+                save = f" -> {step.save_path}" if step.save_path else ""
+                print(f"  {step.number:2}. {step.keyword}: {step.arg[:70]}{save}")

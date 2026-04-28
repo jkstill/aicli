@@ -5,10 +5,10 @@ from .base import BaseDriver, ResponseChunk
 
 
 class GeminiDriver(BaseDriver):
-    def configure(self, api_base, api_key, model, options=None):
+    def configure(self, api_base, api_key, model, options=None, stream_read_timeout=600):
         raise NotImplementedError("Gemini driver not yet implemented (Phase 3).")
 
-    def send(self, messages, system_prompt="", stream=True) -> Generator[ResponseChunk, None, None]:
+    def send(self, messages, system_prompt="", stream=True, use_tools=True) -> Generator[ResponseChunk, None, None]:
         raise NotImplementedError
 
     def list_models(self):

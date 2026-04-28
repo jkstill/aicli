@@ -1,8 +1,8 @@
 # aicli Internal API Reference
 
-This document describes the internal layers and contracts that connect the CLI
-frontend, the core execution engine, and the vendor drivers. It is intended for
-contributors, driver authors, and anyone extending aicli's behaviour.
+This document describes the internal layers and contracts connecting the CLI
+frontend, the V2 planner/executor core, and the vendor drivers. It is intended
+for contributors, driver authors, and anyone extending aicli's behaviour.
 
 For adding a new LLM provider see [ADD-LLM.md](ADD-LLM.md).
 
@@ -12,18 +12,20 @@ For adding a new LLM provider see [ADD-LLM.md](ADD-LLM.md).
 
 - [Architectural Overview](#architectural-overview)
 - [Layer 1 — CLI Frontend (`cli.py`)](#layer-1--cli-frontend)
-- [Layer 2 — Core Layer](#layer-2--core-layer)
-  - [Action Schema (`core/actions.py`)](#action-schema)
-  - [Action Parser (`core/parser.py`)](#action-parser)
+- [Layer 2 — V2 Planner/Executor Core](#layer-2--v2-plannerexecutor-core)
+  - [Plan Parser (`core/plan_parser.py`)](#plan-parser)
+  - [Result Store (`core/result_store.py`)](#result-store)
+  - [Planner (`core/planner.py`)](#planner)
+  - [Orchestrator (`core/orchestrator.py`)](#orchestrator)
   - [Executor (`core/executor.py`)](#executor)
-  - [Session (`core/session.py`)](#session)
-  - [System Prompts (`core/system_prompt.py`)](#system-prompts)
+  - [Action Schema (`core/actions.py`)](#action-schema)
+  - [System Prompts (`core/system_prompts/`)](#system-prompts)
 - [Layer 3 — Driver Interface (`drivers/base.py`)](#layer-3--driver-interface)
 - [Ollama Driver (`drivers/ollama.py`)](#ollama-driver)
 - [Driver Registry (`drivers/registry.py`)](#driver-registry)
 - [Config (`config.py`)](#config)
 - [Output Layer (`output/`)](#output-layer)
-- [Data Flow — One Full Turn](#data-flow--one-full-turn)
+- [Data Flow — One Full Task](#data-flow--one-full-task)
 - [Error Handling](#error-handling)
 
 ---
@@ -31,31 +33,36 @@ For adding a new LLM provider see [ADD-LLM.md](ADD-LLM.md).
 ## Architectural Overview
 
 ```
-┌──────────────────────────────────────────────────┐
-│  cli.py  (main, run_turn, _stream_response, ...) │
-│  Owns: session, renderer, logger, executor       │
-└──────────────────┬───────────────────────────────┘
-                   │
-         ┌─────────┴──────────┐
-         │  Core Layer        │
-         │  actions.py        │  ActionRequest / ActionResult / ActionType
-         │  parser.py         │  XML action block → ActionRequest
-         │  executor.py       │  ActionRequest → ActionResult (+ permission check)
-         │  session.py        │  conversation history
-         │  system_prompt.py  │  system prompt builders
-         └─────────┬──────────┘
-                   │
-         ┌─────────┴──────────┐
-         │  Driver            │
-         │  base.py           │  BaseDriver ABC
-         │  ollama.py         │  Ollama REST implementation
-         │  registry.py       │  name → driver class
-         └────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  cli.py  (main, run_task)                             │
+│  Owns: renderer, logger, driver instances             │
+└──────────────────────┬────────────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │  Planner                │  sends task to LLM, gets plan text
+          │  plan_parser.py         │  text → list[PlanStep]
+          │  result_store.py        │  step outputs + {RESULT_OF_STEP_N}
+          │  orchestrator.py        │  step execution loop
+          └────────────┬────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │  executor.py            │  READFILE / WRITEFILE / LISTDIR / EXEC
+          │  actions.py             │  ActionRequest / ActionResult / ActionType
+          └─────────────────────────┘
+                       │
+          ┌────────────┴────────────┐
+          │  Driver (analysis)      │  PROMPT / GENCODE dispatched here
+          │  base.py                │  BaseDriver ABC
+          │  ollama.py              │  Ollama REST implementation
+          │  registry.py            │  name → driver class
+          └─────────────────────────┘
 ```
 
-**Key invariant:** The executor and the driver never talk to each other.
-The driver sends prompts and receives text/tool-calls. The executor parses
-text and performs actions. This separation is enforced by the call graph.
+**Key invariants:**
+
+- The executor never calls the driver. The driver never calls the executor.
+- The LLM never touches the filesystem; only the orchestrator/executor does.
+- The planner and the analysis driver may be different model instances.
 
 ---
 
@@ -68,89 +75,246 @@ text and performs actions. This separation is enforced by the call graph.
 Entry point. Responsibilities:
 
 1. Load config and parse CLI flags.
-2. Resolve `driver/model-name` via `_parse_model()`.
-3. Instantiate and configure the driver.
-4. Build the `Executor` with permission settings.
-5. Build the effective system prompt.
-6. Dispatch to pipe / file / REPL mode.
+2. Resolve `driver/model-name` for the planner driver.
+3. Resolve `--analysis-model` (falls back to planner driver if not specified).
+4. Load the planner system prompt (built-in or `--system-prompt-file`).
+5. Dispatch to pipe / file / REPL mode.
 
-### `run_turn(prompt, session, driver, executor, renderer, logger, ...)`
+### `run_task(task, planner_driver, analysis_driver, ...)`
 
-Executes one full user prompt, including any number of action rounds.
+Executes one full user task through the planner/executor pipeline:
 
 ```
-for each round (up to max_action_rounds=10):
-    1. send session messages to driver (streaming)
-    2. parse actions from response (native tools or XML blocks)
-    3. record assistant turn in session
-    4. if no actions: done
-    5. for each action:
-         a. print summary
-         b. confirm (unless auto_approve)
-         c. executor.execute(req)  →  ActionResult
-         d. print result
-    6. add combined results to session as a user message
-    7. loop (model sees the results and continues)
+1. Planner.get_plan(task)         → plan text (streamed if --verbose)
+2. parse_plan(plan_text)          → list[PlanStep]
+3. renderer.print_plan(steps)     → show parsed plan to user
+4. if --dry-run: return
+5. Orchestrator.run(steps)        → execute each step
 ```
 
-### `_stream_response(driver, messages, system_prompt, renderer)`
+### `_setup_driver(driver_name, model_name, config, ...)`
 
-Drives the streaming generator from the driver. Writes text chunks to the
-renderer buffer. Returns `(full_text, done_chunk)` when the `done=True`
-chunk arrives.
+Instantiates, configures, and returns a driver. Used for both the planner
+driver and the (optional) separate analysis driver.
+
+---
+
+## Layer 2 — V2 Planner/Executor Core
+
+### Plan Parser
+
+**File:** `src/aicli/core/plan_parser.py`
+
+Converts raw LLM plan text into an ordered list of `PlanStep` objects.
+
+#### `PlanStep` dataclass
 
 ```python
-full_text, done_chunk = _stream_response(driver, messages, system_prompt, renderer)
-# full_text: accumulated text (same as renderer._buffer before finalize())
-# done_chunk: ResponseChunk(done=True, native_tool_calls=[...], tokens_in=N, ...)
+@dataclass
+class PlanStep:
+    number: int      # 1-indexed step number
+    keyword: str     # uppercase: READFILE, WRITEFILE, LISTDIR, EXEC, PROMPT, GENCODE
+    arg: str         # text on the keyword line (command, path, or language)
+    body: str        # multi-line body following the keyword line
+    save_path: str   # GENCODE only: extracted from SAVEAS: line
 ```
 
-### `_native_call_to_action_request(tc: NativeToolCall) → ActionRequest | None`
+#### `parse_plan(text: str) → list[PlanStep]`
 
-Converts a `NativeToolCall` from the driver into an `ActionRequest` understood
-by the executor. Two-step process:
+Parses an LLM response into steps. Tolerates common model output variations:
 
-1. **Normalize parameters** — `_normalize_params()` maps model-specific aliases
-   to canonical names (`file_path` → `path`, `cmd` → `command`, etc.).
-2. **Infer action type** — `_infer_action_type()` maps function name to
-   `ActionType`. Falls back to argument-key heuristics when the model emits
-   an empty or non-standard function name (observed with `batiai/qwen3.6-35b`).
+| Variation | Example | Handled by |
+|-----------|---------|------------|
+| Standard format | `READFILE: cat /path` | Default |
+| Bare path (no command) | `READFILE: /path/to/file` | Normalized to `cat /path/to/file` |
+| Key=value arg | `READFILE file="/path"` | Regex extraction |
+| Backtick-wrapped line | `` `READFILE: /path` `` | Backtick strip |
+| Step-numbered prefix | `Step 1: READFILE: /path` | Regex prefix group |
+| Outer code fence | ` ```\nREADFILE...\n``` ` | `_strip_outer_fence()` |
+| Lowercase keywords | `readfile: /path` | Case-insensitive regex |
 
-### `_infer_action_type(name, params) → ActionType | None`
+**READFILE normalization:** If the arg starts with `/` or `~` and contains no
+spaces, it is treated as a bare path and prefixed with `cat`. Key=value formats
+(`file=`, `path=`, `filename=`) are also normalized to `cat <path>`.
 
-Resolution order:
+**GENCODE:** The `SAVEAS: <path>` line within the GENCODE body is extracted into
+`step.save_path` and removed from `step.body`. A fallback also checks for
+`output=` in the keyword arg line.
 
-1. Exact normalised name match (`writefile` → `WRITE_FILE`).
-2. Substring match in normalised name (`write` → `WRITE_FILE`).
-3. Argument-key heuristics:
-   - `command` present → `EXECUTE`
-   - `pattern` present → `SEARCH_FILES`
-   - `recursive` present → `LIST_DIRECTORY`
-   - `content` / `file_content` / `text` present → `WRITE_FILE`
-   - `path` / `file_path` present → `READ_FILE`
+**WRITEFILE:** If the arg matches `file=<path>` or `path=<path>`, only the path
+is kept as `arg`. The body (possibly empty) becomes the write content.
 
-### `_PARAM_ALIASES`
-
-A dict mapping variant parameter names to canonical names:
+#### `KEYWORDS`
 
 ```python
-{
-    "file_path": "path", "filepath": "path", "filename": "path",
-    "file_content": "content", "file_contents": "content", "text": "content",
-    "file_mode": "mode",
-    "directory": "path", "dir": "path", "dir_path": "path",
-    "cmd": "command", "shell_command": "command",
-    "cwd": "working_dir", "working_directory": "working_dir",
-}
+KEYWORDS = frozenset(["READFILE", "WRITEFILE", "LISTDIR", "EXEC", "PROMPT", "GENCODE"])
 ```
 
 ---
 
-## Layer 2 — Core Layer
+### Result Store
+
+**File:** `src/aicli/core/result_store.py`
+
+Stores step outputs keyed by step number and substitutes placeholder references.
+
+#### `ResultStore`
+
+```python
+store = ResultStore()
+store.store(1, "CSV data content here")
+store.store(2, "Analysis text from LLM")
+
+store.get(1)     # → "CSV data content here"
+store.latest()   # → "Analysis text from LLM" (most recently stored)
+
+text = "Based on {RESULT_OF_STEP_1} and {RESULT_OF_PREVIOUS_STEP}"
+store.substitute(text)
+# → "Based on CSV data content here and Analysis text from LLM"
+```
+
+#### Substitution patterns
+
+| Pattern | Replaced with |
+|---------|--------------|
+| `{RESULT_OF_STEP_N}` | Output of step N (1-indexed) |
+| `{RESULT_OF_PREVIOUS_STEP}` | Output of the most recently stored step |
+
+Both patterns are case-insensitive. If a referenced step number has no stored
+result, the placeholder is replaced with a `[Result of step N not available]`
+string.
+
+---
+
+### Planner
+
+**File:** `src/aicli/core/planner.py`
+
+Sends the user's task to the LLM with the planner system prompt and returns the
+raw plan text.
+
+#### `load_system_prompt(override_path=None) → str`
+
+Loads the planner system prompt. With no argument, reads the built-in
+`core/system_prompts/default.md`. Pass a path to override.
+
+#### `Planner(driver, system_prompt)`
+
+```python
+planner = Planner(driver=ollama_driver, system_prompt=load_system_prompt())
+plan_text = planner.get_plan(
+    task="Analyze /tmp/data.csv and write a report to /tmp/report.md",
+    stream_callback=renderer.stream_chunk,  # optional: stream as it arrives
+)
+```
+
+`get_plan()` wraps the task in a directive prefix to improve model compliance:
+
+```
+Produce a step plan using ONLY step blocks (READFILE, WRITEFILE, ...). No prose.
+
+TASK: <user task>
+```
+
+The driver is called with `use_tools=False` — no native tool schemas are
+included in the request.
+
+---
+
+### Orchestrator
+
+**File:** `src/aicli/core/orchestrator.py`
+
+Executes a list of `PlanStep` objects sequentially, managing the `ResultStore`
+and dispatching steps to the appropriate handler.
+
+#### `Orchestrator(analysis_driver, allowed_dirs, allow_exec, auto_approve, dry_run, verbose, renderer, exec_timeout)`
+
+```python
+orch = Orchestrator(
+    analysis_driver=driver,
+    allowed_dirs=["/tmp", "/home/user/reports"],
+    allow_exec=True,
+    auto_approve=True,
+    dry_run=False,
+    verbose=False,
+    renderer=renderer,
+    exec_timeout=300,
+)
+final_output = orch.run(steps)
+```
+
+#### `Orchestrator.run(steps: list[PlanStep]) → str`
+
+Iterates through all steps. Returns the text output of the last `PROMPT` step
+(if any) — suitable for display or logging.
+
+#### Step handlers
+
+| Step | Handler | Notes |
+|------|---------|-------|
+| READFILE | `_exec_readfile` | `subprocess.run(arg, shell=True)` — no `--allow-exec` needed |
+| WRITEFILE | `_exec_writefile` | Uses `Executor._write_file`; path must be in `allowed_dirs` |
+| LISTDIR | `_exec_listdir` | Uses `Executor._list_directory` |
+| EXEC | `_exec_exec` | Uses `Executor._execute`; requires `allow_exec=True` |
+| PROMPT | `_exec_prompt` | Dispatches to `analysis_driver.send(use_tools=False)` |
+| GENCODE | `_exec_gencode` | Dispatches to LLM with code-generation system prompt; strips fences; writes to `save_path` |
+
+#### Auto-injection
+
+If a `PROMPT` step's content contains no `{RESULT_OF_STEP_N}` references,
+the most recent stored result is automatically appended as `\n\nData:\n<result>`.
+
+If a `WRITEFILE` step's body is empty, the most recent stored result is used
+as the write content.
+
+This compensates for models that generate steps without explicit result
+references.
+
+#### Confirmation
+
+For `WRITEFILE`, `EXEC`, and `GENCODE` steps, a Y/n confirmation is shown
+unless `auto_approve=True`. The user can skip individual steps.
+
+---
+
+### Executor
+
+**File:** `src/aicli/core/executor.py`
+
+Low-level file I/O and shell execution engine. Used by the orchestrator for
+WRITEFILE, LISTDIR, and EXEC steps. **Never communicates with a model or driver.**
+
+#### `Executor(allowed_dirs, allow_exec)`
+
+```python
+executor = Executor(
+    allowed_dirs=["/home/user/project", "/tmp"],
+    allow_exec=True,
+)
+result = executor.execute(ActionRequest(...))
+```
+
+#### Permission rules
+
+| Operation | Rule |
+|-----------|------|
+| Read | Always permitted — any path. |
+| Write | Target must resolve to inside at least one `allowed_dir`. |
+| List | Always permitted. |
+| Execute | Only if `allow_exec=True`. |
+| Search | Always permitted. |
+
+Path resolution uses `Path.resolve()` (follows symlinks), so a symlink pointing
+outside an allowed directory is blocked for writes.
+
+---
 
 ### Action Schema
 
 **File:** `src/aicli/core/actions.py`
+
+Defines the action vocabulary used internally by the executor.
 
 #### `ActionType` (enum)
 
@@ -163,16 +327,7 @@ class ActionType(str, Enum):
     SEARCH_FILES   = "search_files"
 ```
 
-#### `WriteMode` (enum)
-
-```python
-class WriteMode(str, Enum):
-    CREATE    = "create"     # fails if file already exists
-    OVERWRITE = "overwrite"  # truncate and write
-    APPEND    = "append"     # append to existing content
-```
-
-#### `ActionRequest`
+#### `ActionRequest` / `ActionResult`
 
 ```python
 @dataclass
@@ -180,194 +335,40 @@ class ActionRequest:
     action_type: ActionType
     params: dict[str, Any]
 
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.params.get(key, default)
-```
-
-Canonical parameter sets per action type:
-
-| Action           | Required params | Optional params                            |
-|------------------|-----------------|--------------------------------------------|
-| `read_file`      | `path`          | —                                          |
-| `write_file`     | `path`,         | —                                          |
-|                  | `content`,      |                                            |
-|                  | `mode`          |                                            |
-| `list_directory` | `path`          | `recursive` (bool, default False)          |
-| `execute`        | `command`       | `working_dir`, `timeout` (int, default 30) |
-| `search_files`   | `pattern`,      | `type` (glob\|regex, default glob)         |
-|                  | `path`          |                                            |
-
-#### `ActionResult`
-
-```python
 @dataclass
 class ActionResult:
     action_type: ActionType
     success: bool
-    data: dict[str, Any]   # action-specific result fields
-    error: str | None       # set when success=False
+    data: dict[str, Any]
+    error: str | None
 ```
 
-`ActionResult.to_context_string()` renders the result as a human-readable string
-suitable for feeding back to the model as a user message.
-
-#### `NATIVE_TOOL_SCHEMAS`
-
-A list of OpenAI-compatible function schemas (JSON Schema objects) for all five
-action types. Drivers that support native tool calling pass this list verbatim
-to the API.
-
----
-
-### Action Parser
-
-**File:** `src/aicli/core/parser.py`
-
-Used when a driver does not support native tools. Scans model output for
-`<aicli_action>` XML blocks and returns `ActionRequest` objects.
-
-#### `parse_action_blocks(text: str) → Generator[ActionRequest, None, None]`
-
-Yields one `ActionRequest` per valid `<aicli_action type="...">...</aicli_action>`
-block found in `text`. Blocks with unknown action types or missing required
-parameters are silently skipped.
-
-#### `split_text_and_actions(text: str) → tuple[str, list[ActionRequest]]`
-
-Returns `(clean_text, actions)` where `clean_text` has all action blocks stripped.
-
-#### Action block format (system-prompt mode)
-
-```xml
-<aicli_action type="write_file">
-path: /absolute/path/to/file
-mode: overwrite
-content:
-<<<CONTENT
-file content here
-CONTENT>>>
-</aicli_action>
-
-<aicli_action type="read_file">
-path: /absolute/path/to/file
-</aicli_action>
-
-<aicli_action type="execute">
-command: gnuplot script.gnuplot
-working_dir: /optional/dir
-timeout: 30
-</aicli_action>
-
-<aicli_action type="list_directory">
-path: /absolute/path
-recursive: true
-</aicli_action>
-
-<aicli_action type="search_files">
-pattern: *.sql
-path: /search/root
-type: glob
-</aicli_action>
-```
-
-The `<<<CONTENT ... CONTENT>>>` heredoc is the only multi-line value; all other
-fields are single-line `key: value` pairs.
-
----
-
-### Executor
-
-**File:** `src/aicli/core/executor.py`
-
-Receives `ActionRequest`, enforces permissions, performs the action, returns
-`ActionResult`. **Never communicates with a model or driver.**
-
-#### `Executor(allowed_dirs, allow_exec)`
-
-```python
-executor = Executor(
-    allowed_dirs=["/home/user/project", "/tmp"],
-    allow_exec=True,
-)
-```
-
-- `allowed_dirs` — list of directory paths. Resolved to absolute paths at
-  construction time. Writes outside these dirs raise `PermissionError`.
-- `allow_exec` — gates the `execute` action.
-
-#### `executor.execute(req: ActionRequest) → ActionResult`
-
-Dispatches to the appropriate handler. Raises `PermissionError` (a subclass of
-`Exception` defined in `executor.py`) for write permission violations. All other
-errors are returned as `ActionResult(success=False, error=...)`.
-
-#### Permission rules
-
-| Operation | Rule |
-|-----------|------|
-| `read_file` | Always permitted — any path. |
-| `write_file` | Target must be inside at least one `allowed_dir` after symlink resolution. |
-| `list_directory` | Always permitted. |
-| `execute` | Only if `allow_exec=True`. |
-| `search_files` | Always permitted. |
-
-Path resolution uses `Path.resolve()` which follows symlinks, so a symlink
-pointing outside an allowed directory will be blocked for writes.
-
----
-
-### Session
-
-**File:** `src/aicli/core/session.py`
-
-Maintains the ordered message history for multi-turn conversations.
-
-```python
-@dataclass
-class Session:
-    messages: list[Message]
-    system_prompt: str
-
-    def add_user(self, content: str) -> None: ...
-    def add_assistant(self, content: str) -> None: ...
-    def add_tool_result(self, content: str) -> None:
-        # Appended as a "user" role message so the model sees action results.
-        ...
-    def as_ollama_messages(self) -> list[dict]:
-        # Returns messages in Ollama chat API format: [{role, content}, ...]
-        ...
-```
-
-`add_tool_result()` injects action results as user-role messages. This is how
-the agentic loop works: after the executor runs, its output is appended to the
-session and the model receives it in the next round.
+`ActionResult.to_context_string()` renders the result as human-readable text.
 
 ---
 
 ### System Prompts
 
-**File:** `src/aicli/core/system_prompt.py`
+**Directory:** `src/aicli/core/system_prompts/`
 
-Two system prompt builders, selected by `cli.py` based on whether the driver
-supports native tools:
+#### `default.md`
 
-#### `build_system_prompt(user_system_prompt="") → str`
+The built-in V2 planner system prompt. Instructs the LLM to respond with
+tagged step blocks only. Includes a worked example to improve model compliance.
 
-Used when `driver.supports_native_tools()` is `False`. Prepends the full
-`ACTION_SYSTEM_PROMPT` (which teaches the model the `<aicli_action>` format)
-to any user-supplied system prompt.
+Key rules enforced by the prompt:
 
-#### `build_native_tools_system_prompt(user_system_prompt="") → str`
+- Respond with ONLY step blocks — no prose or explanations
+- Always use absolute paths
+- For GENCODE, always include a SAVEAS: line
+- Use `{RESULT_OF_STEP_N}` to reference prior step output
+- Keep each step focused on one action
 
-Used when `driver.supports_native_tools()` is `True`. Prepends a brief
-`NATIVE_TOOLS_HINT` (which instructs the model to always call tools instead of
-refusing) to any user-supplied system prompt.
+To override the system prompt for a session:
 
-#### Extending the system prompt
-
-To inject additional context for all sessions, add it to `.aicli.yaml` or pass
-it with `--system-prompt-file`. The user system prompt is appended after the
-aicli-managed portion — it never replaces it.
+```bash
+aicli --system-prompt-file my-custom-planner.md ...
+```
 
 ---
 
@@ -396,14 +397,20 @@ class BaseDriver(ABC):
         messages: list[dict],
         system_prompt: str = "",
         stream: bool = True,
+        use_tools: bool = True,
     ) -> Generator[ResponseChunk, None, None]:
         """
         Yield ResponseChunk objects.
 
-        - Text chunks: ResponseChunk(text="...", done=False)
-        - Terminal chunk: ResponseChunk(done=True, native_tool_calls=[...],
-                                        tokens_in=N, tokens_out=M, model="...")
+        Text chunks:    ResponseChunk(text="...", done=False)
+        Terminal chunk: ResponseChunk(done=True, native_tool_calls=[...],
+                                      tokens_in=N, tokens_out=M)
+
         Always yield exactly one done=True chunk as the last item.
+
+        use_tools=False: suppress native tool schemas from the request.
+        This is always set by the planner and analysis calls in V2 mode —
+        V2 does not use tool calling.
         """
 
     @abstractmethod
@@ -415,7 +422,6 @@ class BaseDriver(ABC):
         """Return True if this driver/model supports native function calling."""
 
     def get_native_tool_schema(self) -> list[dict] | None:
-        """Return the tool schema list, or None if not supported."""
         return None
 ```
 
@@ -424,8 +430,8 @@ class BaseDriver(ABC):
 ```python
 @dataclass
 class ResponseChunk:
-    text: str = ""                              # non-empty for text chunks
-    done: bool = False                          # True only for the terminal chunk
+    text: str = ""
+    done: bool = False
     native_tool_calls: list[NativeToolCall] = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
@@ -437,10 +443,16 @@ class ResponseChunk:
 ```python
 @dataclass
 class NativeToolCall:
-    name: str       # function name (may be empty or non-standard for some models)
-    params: dict    # raw argument dict from the model
+    name: str
+    params: dict
     call_id: str = ""
 ```
+
+### The `use_tools` parameter
+
+In V2, the planner and orchestrator always call `driver.send(..., use_tools=False)`.
+This suppresses native tool schemas so the model responds with plain text (the
+step plan or the PROMPT/GENCODE response). Drivers must respect this flag.
 
 ---
 
@@ -450,50 +462,35 @@ class NativeToolCall:
 
 ### Capability detection
 
-On the first call to `supports_native_tools()`, the driver queries
-`POST /api/show` with the model name and inspects the `capabilities` array:
+On the first `supports_native_tools()` call, the driver queries `POST /api/show`
+for the model and inspects the `capabilities` array:
 
-- `"tools"` in capabilities → `supports_native_tools()` returns `True`
-- `"thinking"` in capabilities → `_has_thinking_mode()` returns `True`
+- `"tools"` → native tools supported
+- `"thinking"` → thinking/reasoning mode available
 
-Both results are cached for the lifetime of the driver instance.
+Both are cached for the driver's lifetime.
+
+### `use_tools=False` behaviour
+
+When `use_tools=False` is passed to `send()`, the driver skips adding
+`"tools"` and `"tool_choice"` to the request body, even for capable models.
+The model responds with plain text.
 
 ### Thinking mode auto-disable
 
-When `thinking` is in capabilities and the user has not explicitly set `think`
-in `options`, the driver adds `"options": {"think": false}` to the request body.
-This is necessary because thinking mode re-activates RLHF-trained refusals on
-file operations in the qwen3 and glm4 model families.
-
-To override this behaviour (e.g. to force thinking mode), set `think: true`
-in the config:
-
-```yaml
-# ~/.config/aicli/config.yaml
-drivers:
-  ollama:
-    options:
-      think: true
-```
-
-### Tool choice
-
-When native tools are enabled, the driver adds `"tool_choice": "required"` to
-the request body. This instructs the model to always call a tool rather than
-responding with plain text.
+When `thinking` is in capabilities and `use_tools=True` (legacy/V1 mode),
+the driver adds `"options": {"think": false}` unless the user has set `think`
+in config. Thinking mode re-activates RLHF refusals on file operations.
 
 ### Streaming protocol
 
-The Ollama streaming response is newline-delimited JSON. Each line is a chunk:
+Newline-delimited JSON. Each line is a chunk:
 
 ```json
 {"message": {"role": "assistant", "content": "Hello"}, "done": false}
 {"message": {"role": "assistant", "content": " world"}, "done": false}
-{"message": {"tool_calls": [{"function": {"name": "write_file", "arguments": {...}}}]}, "done": false}
 {"done": true, "prompt_eval_count": 42, "eval_count": 15}
 ```
-
-Text content and tool calls may appear in any chunk, including the final done chunk.
 
 ---
 
@@ -504,20 +501,17 @@ Text content and tool calls may appear in any chunk, including the final done ch
 ```python
 from aicli.drivers.registry import get_driver, list_drivers
 
-driver = get_driver("ollama")   # returns OllamaDriver()
-names  = list_drivers()         # ["ollama", "gemini", "claude", "openai"]
+driver = get_driver("ollama")    # → OllamaDriver()
+names  = list_drivers()          # → ["ollama", "gemini", "claude", "openai"]
 ```
 
 `get_driver(name)` raises `ValueError` for unknown names.
 
-To register a new driver, add it to `_REGISTRY` in `registry.py`:
+To add a driver, import it and add it to `_REGISTRY`:
 
 ```python
 _REGISTRY: dict[str, type[BaseDriver]] = {
     "ollama":  OllamaDriver,
-    "gemini":  GeminiDriver,
-    "claude":  ClaudeDriver,
-    "openai":  OpenAIDriver,
     "myvendor": MyVendorDriver,   # ← add here
 }
 ```
@@ -530,56 +524,21 @@ _REGISTRY: dict[str, type[BaseDriver]] = {
 
 ### `load_config() → dict`
 
-Loads and deep-merges configurations in order:
-
-1. Built-in defaults (`_DEFAULTS`)
-2. `~/.config/aicli/config.yaml`
-3. `./.aicli.yaml` (current working directory)
-
-Returns a flat merged dict. Missing keys always fall through to defaults.
+Deep-merges in order: built-in defaults → `~/.config/aicli/config.yaml` →
+`./.aicli.yaml`.
 
 ### `driver_config(config, driver_name) → dict`
 
-Extracts the `config["drivers"][driver_name]` sub-dict, or `{}` if absent.
+Returns `config["drivers"][driver_name]` or `{}`.
 
 ### `resolve_api_key(driver_cfg) → str | None`
 
-Reads the API key for a driver: first checks `api_key_env` (environment variable
-name), then `api_key` (literal value). Returns `None` if neither is set.
+Reads key from `api_key_env` (env var name) or `api_key` (literal).
 
 ### `filter_models(models, config) → list[str]`
 
-Removes model names that match any pattern in `config["model_exclusions"]`.
-
-```python
-from aicli.config import filter_models, load_config
-
-config = load_config()
-visible = filter_models(driver.list_models(), config)
-```
-
-Patterns use [fnmatch](https://docs.python.org/3/library/fnmatch.html) syntax
-and are matched **case-insensitively** against the full model name string.
-
-Built-in default patterns (from `_DEFAULTS["model_exclusions"]`):
-
-| Pattern | Rationale |
-|---------|-----------|
-| `*embed*` | Embedding models — Ollama returns HTTP 400 on chat requests |
-| `llama3:*` | Original llama3 family — no tool calling, does not follow action protocol |
-
-Users extend the list via `~/.config/aicli/config.yaml`:
-
-```yaml
-model_exclusions:
-  - "*embed*"
-  - "llama3:*"
-  - "llava*"
-  - "gemma3*"
-```
-
-`filter_models()` is called by `cli.main()` when `--list-models` is active.
-It is a pure function and does not modify `config`.
+Removes models matching `config["model_exclusions"]` patterns (fnmatch,
+case-insensitive).
 
 ---
 
@@ -587,99 +546,83 @@ It is a pure function and does not modify `config`.
 
 ### `Renderer` (`output/renderer.py`)
 
-Handles terminal output for streaming text and action feedback.
-
 ```python
-renderer = Renderer(markdown=True)   # rich Markdown rendering enabled
+renderer = Renderer(markdown=True)
 
-# Called during streaming
+# Streaming
 renderer.stream_chunk("partial text...")
-renderer._buffer  # accumulated text so far
+renderer.finalize()
 
-# Called when streaming is done
-renderer.finalize()   # prints final newline; re-renders with rich if markdown=True
+# Plan display (V2)
+renderer.print_plan(steps)       # display step list before execution
 
-# Action feedback
-renderer.print_action_header("write_file", "/tmp/out.txt")
-renderer.print_action_result(success=True, message="Done.")
-
-# User confirmation (returns True = approved, False = skipped)
-approved = renderer.confirm("Allow write_file?")
-
-# Info/warning/error messages to stderr
+# Confirmations and status
+renderer.confirm("Allow WRITEFILE?")   # → True | False
 renderer.print_info("...")
 renderer.print_warning("...")
 renderer.print_error("...")
+renderer.print_action_header("WRITEFILE", "/tmp/report.md")
+renderer.print_action_result(success=True, message="Done.")
 ```
 
 ### `SessionLogger` (`output/logger.py`)
 
 ```python
 logger = SessionLogger(log_dir="~/.local/share/aicli/logs", enabled=True)
-logger.log("user", "the user's prompt text")
-logger.log("assistant", "the model's response text")
-logger.log("tool", "action result context string")
+logger.log("user", "task text")
+logger.log("assistant", "plan text")
+logger.log("tool", "step results")
 logger.close()
 ```
 
-Log files are written to `<log_dir>/session_<YYYYMMDD_HHMMSS>.log`.
+Logs to `<log_dir>/session_<YYYYMMDD_HHMMSS>.log`.
 
 ---
 
-## Data Flow — One Full Turn
-
-This traces a single user prompt through the entire system.
+## Data Flow — One Full Task
 
 ```
-User types: "Write a gnuplot script to /tmp/sine.gnuplot"
+User: "Read /tmp/data.csv, analyze for anomalies, write to /tmp/report.md"
 
-1. cli.main()
-   → Session.add_user("Write a gnuplot script ...")
-   → Logger.log("user", ...)
+1. cli.run_task()
+   → load_system_prompt()  → reads core/system_prompts/default.md
+   → Planner.get_plan(task)
+       → messages = [{"role": "user", "content": "Produce a step plan...\nTASK: ..."}]
+       → driver.send(messages, system_prompt=planner_prompt, use_tools=False)
+         yields ResponseChunk(text="READFILE: cat /tmp/data.csv\n") ...
+         yields ResponseChunk(text="PROMPT: Analyze for anomalies...\n") ...
+         yields ResponseChunk(done=True)
+       → plan_text = "READFILE: cat /tmp/data.csv\nPROMPT: ..."
 
-2. cli.run_turn() — Round 1
-   → session.as_ollama_messages()
-     returns [{role: "user", content: "Write a gnuplot script ..."}]
-   → driver.send(messages, system_prompt=NATIVE_TOOLS_HINT, stream=True)
-     yields ResponseChunk(text="I'll create that file.")
-     yields ResponseChunk(text="")
-     yields ResponseChunk(done=True, native_tool_calls=[
-               NativeToolCall(name="write_file",
-                              params={"path": "/tmp/sine.gnuplot", "content": "..."})
-           ])
-   → renderer.stream_chunk("I'll create that file.")
-   → renderer.finalize()
-   → Logger.log("assistant", "I'll create that file.")
+2. parse_plan(plan_text)
+   → steps = [
+       PlanStep(1, "READFILE", "cat /tmp/data.csv", ""),
+       PlanStep(2, "PROMPT", "Analyze for anomalies", ""),
+       PlanStep(3, "WRITEFILE", "/tmp/report.md", ""),
+     ]
 
-3. cli.run_turn() — Action dispatch
-   → _native_call_to_action_request(NativeToolCall(...))
-     → _normalize_params({"path": ..., "content": ...})
-     → ActionRequest(WRITE_FILE, {path, content, mode=OVERWRITE})
-   → renderer.print_action_header("write_file", "/tmp/sine.gnuplot")
-   → renderer.confirm("Allow write_file?")  [if not auto_approve]
-   → executor.execute(ActionRequest(WRITE_FILE, ...))
-     → _resolve_and_check("/tmp/sine.gnuplot", write=True)
-       → Path("/tmp/sine.gnuplot").resolve() → /tmp/sine.gnuplot
-       → is /tmp/sine.gnuplot inside /tmp? yes → OK
-     → path.write_text(content)
-     → ActionResult(WRITE_FILE, success=True, data={"path": "/tmp/sine.gnuplot"})
-   → renderer.print_action_result(True, "Done.")
-   → result.to_context_string()
-     → "[write_file result]: File written successfully to /tmp/sine.gnuplot"
-   → session.add_tool_result("[write_file result]: ...")
-   → Logger.log("tool", ...)
+3. renderer.print_plan(steps)
+   → shows numbered step list to user
 
-4. cli.run_turn() — Round 2
-   → session.as_ollama_messages() now has 3 messages:
-       [{role: "user",      content: "Write a gnuplot script..."},
-        {role: "assistant", content: "I'll create that file."},
-        {role: "user",      content: "[write_file result]: ..."}]
-   → driver.send(messages, ...)
-     yields ResponseChunk(text="The gnuplot script has been written.")
-     yields ResponseChunk(done=True, native_tool_calls=[])  ← no more actions
-   → renderer streams + finalises
-   → session.add_assistant("The gnuplot script has been written.")
-   → No actions → break out of round loop
+4. Orchestrator.run(steps)
+   →
+   Step 1: READFILE
+     subprocess.run("cat /tmp/data.csv", shell=True)
+     store.store(1, "Date,Value,Status\n2024-01-01,100,OK\n...")
+
+   Step 2: PROMPT
+     auto-inject: prompt += "\n\nData:\n" + store.latest()
+     analysis_driver.send([{"role": "user", "content": expanded_prompt}],
+                           use_tools=False)
+     yields LLM analysis text...
+     store.store(2, "## Anomaly Report\n...")
+     renderer.stream_chunk("## Anomaly Report\n...")
+     renderer.finalize()
+
+   Step 3: WRITEFILE
+     body is empty → auto-inject: content = store.latest()
+     Executor._write_file(path="/tmp/report.md", content="## Anomaly Report\n...")
+     store.store(3, "Written to /tmp/report.md")
 ```
 
 ---
@@ -688,9 +631,10 @@ User types: "Write a gnuplot script to /tmp/sine.gnuplot"
 
 | Situation | Behaviour |
 |-----------|-----------|
-| Write outside allowed dirs | `executor.execute()` raises `PermissionError`; caught in `run_turn()`; error shown to user; action skipped |
-| Execute without `--allow-exec` | `ActionResult(success=False, error="Command execution denied: ...")` |
-| Model refused to call a tool | Done chunk has `native_tool_calls=[]`; `split_text_and_actions()` is tried on text; if no XML blocks found, turn ends normally |
-| Ollama server unreachable | `httpx` raises; propagates to CLI; Python traceback |
-| Driver not implemented | `get_driver("gemini")` succeeds; first `configure()` or `send()` call raises `NotImplementedError` |
-| Action round limit reached | Warning printed; loop exits after `max_action_rounds=10` rounds |
+| Write outside allowed dirs | `executor.execute()` raises `PermissionError`; caught in orchestrator; step marked failed; stored as `[Step N failed: ...]` |
+| EXEC without `--allow-exec` | `ActionResult(success=False, error="Command execution denied")` |
+| GENCODE missing SAVEAS | `StepResult(success=False, error="GENCODE step is missing a SAVEAS: line.")` |
+| No plan steps parsed | Warning printed; raw response shown; task aborted |
+| Ollama server unreachable | `httpx` exception propagates to CLI; Python traceback |
+| Driver not implemented | `configure()` or `send()` raises `NotImplementedError` |
+| Step failure | Error printed; step result stored as failure text; execution continues to next step |

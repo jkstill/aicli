@@ -1,26 +1,54 @@
-# aicli — Universal Agentic CLI for Large Language Models
+# aicli v2 — Universal Agentic CLI for Large Language Models
 
-aicli is a command-line tool that gives any LLM agentic capabilities: reading and
-writing files, listing directories, searching for files, and executing shell commands.
+Disclaimer: 
+
+At the time of this writing, open weight models such as those available on Ollama are not yet capable of reliably following the step-based plan format required by aicli v2. 
+
+The planner/executor architecture is designed to be robust even with smaller models, but the quality of the generated plans can vary significantly. 
+
+Or, there may be no plan at all. This is a limitation of the current state of open models, not the framework itself.
+
+I will check the capabilities of new models with this toolkit in 12 months, to see if the models have improved to the point where they can be used effectively with aicli v2.
+
+aicli is a command-line tool that gives any LLM agentic capabilities: reading files,
+writing files, listing directories, executing shell commands, and generating code.
 Switch between Ollama (local), Gemini, Claude, or OpenAI with a single flag. Your
-prompts and workflows stay the same regardless of which model is running them.
+prompts stay the same regardless of which model runs them.
+
+**v2 introduces the planner/executor model.** Instead of asking the LLM to
+*perform* actions directly, aicli v2 asks it to *plan* a sequence of tagged steps.
+The framework executes the steps itself. This makes the system reliable with small
+local models that struggle with direct action protocols.
 
 ```
 Architecture (DBI/DBD pattern):
 
-  User prompt
+  User task
       │
       ▼
-  aicli (CLI frontend)          ← permission enforcement, action loop, output
-      │ AICLI Core API
-      ▼
-  Core layer                    ← action schema, parser, executor, session
+  aicli (CLI)                ← argument parsing, display, confirmation prompts
       │
       ▼
-  Vendor driver                 ← ollama | gemini | claude | openai
+  Planner                    ← sends task + system prompt to LLM, gets step plan
       │
       ▼
-  LLM provider                  ← local Ollama / cloud API
+  Plan Parser                ← splits LLM response into typed steps
+      │
+      ▼
+  Orchestrator               ← executes steps sequentially
+      │           │
+      │           ▼
+      │       READFILE / WRITEFILE / LISTDIR / EXEC
+      │           ↑ framework executes these directly
+      │
+      ▼
+  Analysis driver            ← PROMPT / GENCODE steps dispatched to LLM
+      │
+      ▼
+  Vendor driver              ← ollama | gemini | claude | openai
+      │
+      ▼
+  LLM provider               ← local Ollama / cloud API
 ```
 
 ---
@@ -29,14 +57,16 @@ Architecture (DBI/DBD pattern):
 
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [How It Works](#how-it-works)
+- [Step Keywords](#step-keywords)
 - [Input Modes](#input-modes)
 - [CLI Reference](#cli-reference)
 - [Configuration](#configuration)
-  - [Model Exclusions](#model-exclusions)
 - [Permission Model](#permission-model)
-- [Action Types](#action-types)
+- [Multi-Model Pipelines](#multi-model-pipelines)
 - [Model Selection](#model-selection)
 - [Model Compatibility](#model-compatibility)
+- [Diagnosing Hangs](#diagnosing-hangs)
 - [Examples](#examples)
 - [Testing](#testing)
 - [Project Layout](#project-layout)
@@ -50,93 +80,136 @@ Architecture (DBI/DBD pattern):
 ```bash
 # From the project root — editable install (recommended for development)
 pip install -e .
-
-# Or install into a specific Python interpreter
-python3.11 -m pip install -e .
 ```
 
 Dependencies installed automatically: `httpx`, `pyyaml`, `rich`, `click`.
-
-Optional driver extras (Phase 3, not yet implemented):
-
-```bash
-pip install -e ".[gemini]"     # adds google-generativeai
-pip install -e ".[anthropic]"  # adds anthropic SDK
-pip install -e ".[openai]"     # adds openai SDK
-```
 
 ---
 
 ## Quick Start
 
 ```bash
-# Simplest possible run — interactive REPL with your configured default model
-aicli
+# Analyze a data file and write a report (dry-run to see the plan first)
+echo "Read /tmp/data.csv, analyze it for anomalies, and write a report to /tmp/report.md" | \
+  aicli --model ollama/qwen3.5 \
+        --include-directories /tmp \
+        --dry-run
 
-# One-shot question via pipe
-echo "Explain what a gnuplot script is in two sentences." | aicli
-
-# Write a file (requires --include-directories to allow writes)
-echo "Write a hello-world bash script to /tmp/hello.sh" | \
-  aicli --model ollama/glm-4.7-flash:latest \
+# Run the same task for real
+echo "Read /tmp/data.csv, analyze it for anomalies, and write a report to /tmp/report.md" | \
+  aicli --model ollama/qwen3.5 \
         --include-directories /tmp \
         --auto-approve
 
-# Full agentic session: write a script, run it, report output
-aicli --model ollama/glm-4.7-flash:latest \
-      --include-directories ~/project \
-      --allow-exec \
-      --auto-approve \
-      --prompt-file prompts/generate-report.md
+# Use one model for planning and a larger one for analysis
+aicli --model ollama/qwen3.5 \
+      --analysis-model ollama/batiai/qwen3.6-35b:q4 \
+      --prompt-file prompts/analyze-sar.md \
+      --include-directories ~/oracle-hc \
+      --auto-approve
+
+# Interactive REPL
+aicli --model ollama/qwen3.5 --include-directories ~/project
 ```
+
+---
+
+## How It Works
+
+### 1. The LLM produces a plan
+
+When you give aicli a task, it sends the task to the LLM along with a system
+prompt that instructs the model to respond with a sequence of tagged steps —
+not prose, not code, not explanations. Just steps.
+
+```
+READFILE: head -50 /home/user/data/sar.csv
+PROMPT: Identify the columns that show memory pressure in this data:
+{RESULT_OF_STEP_1}
+GENCODE: gnuplot
+SAVEAS: /home/user/charts/memory.gnuplot
+Create a gnuplot script that plots the memory pressure columns.
+Use /home/user/data/sar.csv as input. Output PNG at 1200x800.
+EXEC: gnuplot /home/user/charts/memory.gnuplot
+PROMPT: Write a markdown analysis of the memory pressure in this server.
+Reference the chart image generated in the previous step.
+{RESULT_OF_STEP_2}
+WRITEFILE: /home/user/reports/memory-analysis.md
+{RESULT_OF_STEP_5}
+```
+
+### 2. The framework executes the plan
+
+aicli processes each step in order:
+
+| Step | Who executes | What happens |
+|------|-------------|--------------|
+| `READFILE` | Framework | Runs the shell command; stores stdout |
+| `LISTDIR` | Framework | Lists the directory; stores the listing |
+| `EXEC` | Framework | Runs the command; stores stdout/stderr |
+| `WRITEFILE` | Framework | Writes content to the file |
+| `PROMPT` | LLM (analysis driver) | Sends prompt to LLM; stores the response |
+| `GENCODE` | LLM → Framework | LLM generates code; framework strips fences and saves it |
+
+### 3. Results flow between steps
+
+Use `{RESULT_OF_STEP_N}` (1-indexed) in any step body to reference the output
+of a prior step. Use `{RESULT_OF_PREVIOUS_STEP}` for the most recent result.
+
+If a step doesn't include an explicit reference, aicli automatically injects
+the most recent result — this handles the common case where the model forgets
+to add references.
+
+---
+
+## Step Keywords
+
+| Keyword | Argument | Body | Description |
+|---------|----------|------|-------------|
+| `READFILE` | Shell command | — | Run a read command (`cat`, `head`, `grep`, …) and store its output |
+| `WRITEFILE` | Target path | Content to write (may include `{RESULT_OF_STEP_N}`) | Write content to a file |
+| `LISTDIR` | Directory path | — | List directory contents |
+| `EXEC` | Shell command | — | Execute a command (requires `--allow-exec`) |
+| `PROMPT` | Analytical prompt | Additional prompt lines | Send to LLM; store the response |
+| `GENCODE` | Language name | `SAVEAS: <path>` + generation instructions | LLM generates code; framework saves it |
 
 ---
 
 ## Input Modes
 
-aicli accepts prompts in three ways, tried in this order:
-
 ### 1. Pipe mode
 
-If stdin is not a terminal, the entire stdin is read as the prompt:
-
 ```bash
-echo "Summarise /etc/os-release" | aicli --model ollama/glm-4.7-flash:latest -y
-
-cat my-prompt.txt | aicli --model ollama/glm-4.7-flash:latest \
-  --include-directories ~/project -y
+echo "Read /var/log/syslog last 100 lines and summarize errors" | \
+  aicli --model ollama/qwen3.5 --include-directories ~/reports -y
 ```
 
-Pipe mode is non-interactive and exits after one turn (including any action
-rounds the model triggers).
+Stdin is read as the task prompt. Exits after one task.
 
 ### 2. File mode
 
-Pass a prompt file with `--prompt-file` / `-f`. The file is read once and then
-the process exits:
-
 ```bash
 aicli --prompt-file prompts/analyze-sar.md \
-      --model ollama/glm-4.7-flash:latest \
-      --include-directories ~/reports \
+      --model ollama/qwen3.5 \
+      --include-directories ~/oracle-hc \
       --allow-exec -y
 ```
+
+The file contents are the task prompt. Exits after one task.
 
 ### 3. Interactive REPL
 
 If neither pipe nor file mode applies, aicli drops into an interactive session.
-Each prompt you type is one turn; the conversation history is preserved across turns.
+Each prompt you type is one task:
 
 ```
-$ aicli --model ollama/glm-4.7-flash:latest --include-directories ~/project
+$ aicli --model ollama/qwen3.5 --include-directories ~/project
 
-aicli | driver=ollama model=glm-4.7-flash:latest native_tools=True ...
+aicli v2 | planner=ollama/qwen3.5 ...
 Interactive mode — type 'exit' or Ctrl-D to quit.
 
-aicli> What files are in the current directory?
-...
-aicli> Now read the pyproject.toml and summarise it.
-...
+aicli> What files are in ~/project?
+aicli> Read the README.md and summarize it.
 aicli> exit
 ```
 
@@ -147,23 +220,33 @@ aicli> exit
 ```
 Usage: aicli [OPTIONS]
 
-  aicli — universal agentic CLI for large language models.
+  aicli v2 — planner/executor CLI for large language models.
 
 Options:
-  -m, --model TEXT                Model as driver/model-name
-                                  (e.g. ollama/glm-4.7-flash:latest)
-  -f, --prompt-file PATH          Read prompt from file
-  -s, --system-prompt TEXT        Inline system prompt
-      --system-prompt-file PATH   System prompt read from file
-  -d, --include-directories TEXT  Comma-separated directories the model may
-                                  write to (e.g. ~/project,/tmp)
-      --allow-exec                Permit shell command execution
-  -y, --auto-approve              Skip all confirmation prompts (yolo mode)
+  -m, --model TEXT                Planner model as driver/model-name
+                                  (e.g. ollama/qwen3.5)
+      --analysis-model TEXT       Analysis model for PROMPT/GENCODE steps
+                                  (default: same as --model)
+  -f, --prompt-file PATH          Read task prompt from file
+      --system-prompt-file PATH   Override the built-in planner system prompt
+  -d, --include-directories TEXT  Comma-separated directories the framework
+                                  may write to
+      --allow-exec                Permit shell command execution (EXEC steps)
+  -y, --auto-approve              Skip confirmation prompts for writes
+      --dry-run                   Show parsed plan without executing steps
+      --verbose                   Show substituted prompts and step details
       --no-markdown               Disable rich Markdown rendering
       --list-models               List available models for the driver and exit
-      --api-base TEXT             Override the driver's API base URL
-      --api-key TEXT              Override the driver's API key
-      --log-sessions              Write full session log to file
+      --api-base TEXT             Override driver API base URL
+      --api-key TEXT              Override driver API key
+      --log-sessions              Write session log to file
+      --on-error [continue|abort|ask]
+                                  What to do on step failure (default: ask)
+      --trace FILE                Write timing trace to FILE; flushed
+                                  immediately so the file is readable even
+                                  if the process is killed mid-run
+      --stream-timeout FLOAT      Seconds to wait for the next streamed token
+                                  before aborting (default: 120; 0 = no limit)
   -h, --help                      Show this message and exit.
 ```
 
@@ -171,203 +254,121 @@ Options:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | from config | `driver/model-name`. The part before `/` selects the driver. |
-| `--include-directories` | none | Comma-separated absolute or relative paths. The model may only **write** inside these. Reads are unrestricted. |
-| `--allow-exec` | off | Enable the `execute` action. Disabled by default. |
-| `--auto-approve` / `-y` | off | Skip Y/n confirmation for every action. Equivalent to `--yolo`. |
-| `--no-markdown` | off | Print raw text instead of rich-rendered Markdown. Useful in scripts. |
-| `--log-sessions` | off | Append full turn logs to `~/.local/share/aicli/logs/session_<ts>.log`. |
-| `--api-base` | from config | Overrides the driver's API base URL for this run only. |
+| `--model` | from config | `driver/model-name`. The prefix selects the driver. |
+| `--analysis-model` | same as `--model` | Separate model for PROMPT and GENCODE steps. |
+| `--include-directories` | none | Comma-separated paths the framework may write to. Reads are unrestricted. |
+| `--allow-exec` | off | Enable EXEC steps. Off by default for safety. |
+| `--auto-approve` / `-y` | off | Skip all Y/n confirmation prompts. |
+| `--dry-run` | off | Display the parsed plan without executing any step. |
+| `--verbose` | off | Show full substituted prompts and step details while executing. |
+| `--no-markdown` | off | Print raw text instead of rich-rendered Markdown. |
+| `--log-sessions` | off | Append full logs to `~/.local/share/aicli/logs/session_<ts>.log`. |
+| `--on-error` | `ask` | What to do when a step fails: `continue`, `abort`, or `ask`. |
+| `--system-prompt-file` | built-in | Replace the planner system prompt entirely. |
+| `--trace FILE` | off | Write a timing trace to FILE (see [Diagnosing Hangs](#diagnosing-hangs)). |
+| `--stream-timeout` | `120` | Seconds to wait for the next streamed token. Use `0` for no limit. |
 
 ---
 
 ## Configuration
 
-aicli loads configuration from two files, merged in order (later wins):
+aicli loads configuration from two files (later wins):
 
 1. `~/.config/aicli/config.yaml` — global user config
-2. `.aicli.yaml` — per-project config (in current working directory)
+2. `.aicli.yaml` — per-project config (current working directory)
 
 ### Full example config
 
 ```yaml
 # ~/.config/aicli/config.yaml
 
-model: ollama/glm-4.7-flash:latest
-output_format: markdown        # markdown | plain
+model: ollama/qwen3.5
+analysis_model: null          # null = use same as model
+output_format: markdown       # markdown | plain
 confirm_actions: true
 log_sessions: false
 log_dir: ~/.local/share/aicli/logs
+exec_timeout: 300             # seconds, for EXEC steps
 
 drivers:
   ollama:
-    api_base: http://lestrade:11434   # remote Ollama host
+    api_base: http://192.168.1.53:11434
   gemini:
-    api_key_env: GEMINI_API_KEY       # read key from environment variable
+    api_key_env: GEMINI_API_KEY
   claude:
     api_key_env: ANTHROPIC_API_KEY
   openai:
     api_key_env: OPENAI_API_KEY
 
-# Models hidden from --list-models (fnmatch patterns, case-insensitive).
-# Add entries here for any model you have tested and found incompatible.
+# Models hidden from --list-models (fnmatch patterns, case-insensitive)
 model_exclusions:
-  - "*embed*"    # embedding models — not usable as chat models
-  - "llama3:*"   # original llama3 — no tool calling support
+  - "*embed*"    # embedding models
+  - "llama3:*"   # original llama3 — poor instruction following
 ```
 
 ### Per-project override
 
-Place a `.aicli.yaml` at the root of your project:
-
 ```yaml
 # .aicli.yaml  (project root)
-defaults:
-  model: ollama/qwen3-coder:30b
-
+model: ollama/qwen3-coder:30b
 drivers:
   ollama:
     api_base: http://localhost:11434
-```
-
-Any key in `.aicli.yaml` overrides the global config. Missing keys fall back to
-the global config, then to built-in defaults.
-
-### Model exclusions
-
-The `model_exclusions` key holds a list of [fnmatch](https://docs.python.org/3/library/fnmatch.html)
-patterns applied when `--list-models` is run. Models whose names match any
-pattern are hidden from the listing. Patterns are case-insensitive.
-
-Built-in defaults (always active unless overridden):
-
-| Pattern | What it hides |
-|---------|---------------|
-| `*embed*` | Any model with "embed" in its name (embedding models) |
-| `llama3:*` | The original `llama3` family (no tool calling support) |
-
-To extend the exclusion list, add entries in `~/.config/aicli/config.yaml`.
-The lists are **merged**, not replaced — built-in defaults remain active
-unless you redefine the entire `model_exclusions` key:
-
-```yaml
-# ~/.config/aicli/config.yaml
-model_exclusions:
-  - "*embed*"        # keep built-in defaults
-  - "llama3:*"
-  - "llava*"         # multimodal-only, no text tool calling
-  - "gemma3*"        # does not follow aicli action protocol
-  - "llama3.2:*"     # invents wrong tool schema
-```
-
-To disable all filtering and see every model, set an empty list:
-
-```yaml
-model_exclusions: []
 ```
 
 ---
 
 ## Permission Model
 
-Permissions are restrictive by default and must be explicitly granted.
-
 ```
-Reads:    always allowed — any path the model requests can be read
+Reads:    always allowed — any path
 Writes:   only paths inside --include-directories
 Execute:  only if --allow-exec is set
-Approval: confirmation prompt per action, unless -y
+Approval: confirmation prompt per write/exec step, unless -y
 ```
 
-### How write permissions work
-
-`--include-directories` takes a comma-separated list of directory paths. A write
-action is permitted if and only if its resolved path is inside at least one listed
-directory. Symlink traversal outside the allowed set is blocked.
+READFILE (shell read commands) and LISTDIR are always permitted.
+WRITEFILE and GENCODE (which write the generated code file) require the target
+path to be inside an `--include-directories` directory.
+EXEC requires `--allow-exec`.
 
 ```bash
-# Only /tmp is writable
+# /tmp is the only writable directory
 aicli --include-directories /tmp
 
 # Multiple directories
-aicli --include-directories ~/project,/tmp
+aicli --include-directories ~/oracle-hc,/tmp
 
-# Subdirectories of an allowed dir are also allowed
-aicli --include-directories ~/project
-# → writes to ~/project/charts/output.png are OK
+# Subdirectories are included
+aicli --include-directories ~/oracle-hc
+# → writes to ~/oracle-hc/charts/foo.gnuplot are OK
 # → writes to /etc/passwd are denied
 ```
 
-### Confirmation prompts
-
-Unless `-y` is passed, every action prints a summary and asks `[Y/n]`:
-
-```
-Action: write_file — /tmp/report.md (mode=WriteMode.OVERWRITE)
-  Allow write_file? [Y/n]
-```
-
-Press Enter or `y` to allow, `n` to skip that action.
-
 ---
 
-## Action Types
+## Multi-Model Pipelines
 
-The model can request any of five actions. Each action is validated and executed
-by the aicli executor, not the driver.
+Because the planner step and the analysis steps (PROMPT, GENCODE) use the driver
+independently, you can use different models for each role:
 
-### `read_file`
+```bash
+# Fast small model for planning, large model for analysis
+aicli --model ollama/qwen3.5 \
+      --analysis-model ollama/batiai/qwen3.6-35b:q4 \
+      --prompt-file prompts/full-hc-report.md \
+      --include-directories ~/oracle-hc \
+      --allow-exec -y
 
-Read the contents of any file (no directory restriction).
-
-```
-Parameters:
-  path  (required)  Absolute path to read.
-```
-
-### `write_file`
-
-Write content to a file. The path must be inside an `--include-directories` dir.
-
-```
-Parameters:
-  path     (required)  Absolute path to write.
-  content  (required)  File content (any text).
-  mode     (required)  one of: overwrite | append | create
-                       "create" fails if the file already exists.
+# Plan locally with Ollama, analyze with the Claude API
+aicli --model ollama/qwen3.5 \
+      --analysis-model claude/claude-sonnet-4-6 \
+      --prompt-file prompts/analyze-logs.md \
+      --include-directories ~/reports -y
 ```
 
-### `list_directory`
-
-List entries in a directory.
-
-```
-Parameters:
-  path       (required)  Directory to list.
-  recursive  (optional)  true | false (default false)
-```
-
-### `execute`
-
-Run a shell command. Requires `--allow-exec`.
-
-```
-Parameters:
-  command      (required)  Shell command string (passed to /bin/sh).
-  working_dir  (optional)  Working directory for the command.
-  timeout      (optional)  Seconds before timeout (default 30).
-```
-
-### `search_files`
-
-Search for files by glob or regex pattern.
-
-```
-Parameters:
-  pattern  (required)  Search pattern.
-  path     (required)  Root directory to search under.
-  type     (optional)  glob | regex (default glob)
-```
+The planning model only needs to produce a structured step list (a simpler task).
+The analysis model handles the substantive reasoning in PROMPT and GENCODE steps.
 
 ---
 
@@ -376,199 +377,254 @@ Parameters:
 Models are specified as `driver/model-name`:
 
 ```bash
-aicli --model ollama/glm-4.7-flash:latest
+aicli --model ollama/qwen3.5
 aicli --model ollama/qwen3-coder:30b
-aicli --model ollama/batiai/qwen3.6-35b:q3
+aicli --model ollama/batiai/qwen3.6-35b:q4
 aicli --model gemini/gemini-2.5-flash        # Phase 3
 aicli --model claude/claude-sonnet-4-6       # Phase 3
 aicli --model openai/gpt-4o                  # Phase 3
 ```
 
-The part before the first `/` is the driver name. Everything after is passed
-verbatim to the driver as the model identifier.
-
 ### Listing available models
 
 ```bash
-# List models available on the configured Ollama server (exclusions applied)
 aicli --model ollama --list-models
-
-# Point at a specific host
-aicli --model ollama --list-models --api-base http://lestrade:11434
+aicli --model ollama --list-models --api-base http://192.168.1.53:11434
 ```
-
-Models matching any pattern in `model_exclusions` (see [Configuration](#configuration))
-are hidden from this listing. This keeps the list focused on models that are
-actually usable for chat and agentic tasks. To see all models regardless of
-exclusions, temporarily set `model_exclusions: []` in your config or a local
-`.aicli.yaml`.
 
 ---
 
 ## Model Compatibility
 
-aicli uses a hybrid tool strategy: it queries the Ollama `/api/show` endpoint
-for each model's declared capabilities before the first request.
+In v2, the LLM only needs to produce a structured text plan — no tool calling,
+no action block schemas. Any model that can follow formatting instructions works.
 
-| Capability | Strategy | How actions are communicated |
-|------------|----------|------------------------------|
-| `tools` | Native tool calling | Model emits structured JSON tool calls |
-| none | System prompt (fallback) | Model emits `<aicli_action>` XML blocks |
+### Tested models on Ollama
 
-The driver automatically disables thinking mode (`think: false`) for models
-that declare the `thinking` capability, because extended thinking re-activates
-RLHF-trained refusals on file operations in the qwen3/glm4 families.
+| Model | Plan quality | Notes |
+|-------|-------------|-------|
+| `qwen3.5:latest` | Good | Recommended for planning. Standard step format, handles result refs occasionally. |
+| `qwen3-coder:30b` | Good | Strong at code generation tasks. |
+| `glm-4.7-flash:latest` | Variable | Works well as **analysis model**; plan output format is inconsistent (sometimes key=value, sometimes flowchart syntax). |
+| `batiai/qwen3.6-35b:q4` | Good | Good analysis quality. Slow on planning, excellent for PROMPT steps. |
+| `qwen3.5:9b` | Fair | Smaller context; works for simple tasks. |
 
-### Tested models on Ollama (host: lestrade:11434)
+**Recommendation:** Use `qwen3.5` or `qwen3-coder:30b` as the planner model.
+Use `glm-4.7-flash` or `batiai/qwen3.6-35b` as the analysis model for PROMPT/GENCODE steps.
 
-| Model | Tool support | Agentic file ops | Default excluded | Notes |
-|-------|-------------|-----------------|:---:|-------|
-| `glm-4.7-flash:latest` | Native (tools) | Excellent | | **Recommended default.** Consistent, correct write_file params. |
-| `glm-4.7-flash:q4_K_M` | Native (tools) | Excellent | | Quantised variant; same behaviour. |
-| `batiai/qwen3.6-35b:q3` | Native (tools) | Good | | Uses `execute` (shell redirect) for file writes. Requires `--allow-exec`. |
-| `qwen3-coder:30b` | Native (tools) | Good | | Text-mode `<function=...>` fallback parsed automatically. |
-| `qwen3.5:latest` | Native (tools) | Good | | May retry; file is written correctly on retry. |
-| `qwen3.5:9b` | Native (tools) | Fair | | Occasional empty-path tool call on retry; handled gracefully. |
-| `qwen2.5:14b` | Native (tools) | Fair | | Emits JSON code block format; parsed automatically. |
-| `qwen2.5-coder:14b` | Native (tools) | Fair | | Retries needed; works after nudge. |
-| `llama3.2:latest` | Native (tools) | Poor | | Invents non-standard tool schema; rarely writes files. |
-| `llama3:latest` | None | None | ✓ | No native tools; does not emit action blocks. |
-| `gemma3:12b` | None | None | | No native tools; responds with text only. |
-| `llava:7b` | None | None | | Multimodal model; no tool calling support. |
-| `mxbai-embed-large:latest` | N/A | N/A | ✓ | Embedding model; Ollama returns HTTP 400 on chat requests. |
+### Format variations
 
-**`✓ Default excluded`** — hidden from `--list-models` by the built-in `model_exclusions`
-patterns. Add others via your config as you discover them.
+The plan parser tolerates common model output variations:
 
-**Summary:** For reliable agentic file work use `glm-4.7-flash:latest`. For
-large-context code tasks without file I/O, `batiai/qwen3.6-35b:q3` and
-`qwen3-coder:30b` are strong choices with `--allow-exec`.
+- `READFILE: /path` (bare path) → normalized to `cat /path`
+- `READFILE file="/path"` (key=value) → normalized
+- `EXEC command="..."` (key=value) → normalized
+- `` `READFILE /path` `` (backtick-wrapped) → stripped
+- `Step 1: READFILE: ...` (numbered prefix) → handled
+- Plan wrapped in ` ``` ` code fence → stripped
+
+---
+
+## Diagnosing Hangs
+
+Large or thinking-mode models (e.g. `batiai/qwen3.6-35b:q3`) can be silent for
+many minutes before emitting a single token. Use `--trace` to see exactly where
+time is being spent and `--stream-timeout` to set an upper bound.
+
+### Enable tracing
+
+```bash
+echo "my task" | aicli \
+  --model ollama/batiai/qwen3.6-35b:q3 \
+  --include-directories /tmp \
+  --trace /tmp/aicli.trace \
+  --stream-timeout 300 \
+  -y
+```
+
+In a second terminal, tail the trace file while the run is in progress:
+
+```bash
+tail -f /tmp/aicli.trace
+```
+
+### Reading the trace
+
+Each line is `[timestamp] [+elapsed_seconds] EVENT  details`:
+
+```
+[2026-04-28T09:01:00] [+    0.001s] CLI_START                      model=None stream_timeout=300.0s
+[2026-04-28T09:01:00] [+    0.042s] CAPABILITY_PROBE_START         model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:01:00] [+    0.089s] CAPABILITY_PROBE_DONE          model=batiai/qwen3.6-35b:q3 tools=False thinking=True
+[2026-04-28T09:01:00] [+    0.091s] TASK_START                     mode=pipe task_len=58
+[2026-04-28T09:01:00] [+    0.092s] PLAN_START                     task_len=58
+[2026-04-28T09:01:00] [+    0.094s] STREAM_CONNECT                 model=batiai/qwen3.6-35b:q3 read_timeout=300.0s
+[2026-04-28T09:15:42] [+  882.341s] STREAM_FIRST_CHUNK             model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:15:42] [+  882.342s] PLAN_FIRST_TOKEN
+[2026-04-28T09:15:43] [+  883.104s] PLAN_DONE                      response_len=312
+[2026-04-28T09:15:43] [+  883.105s] PLAN_EXEC_START                total_steps=3
+[2026-04-28T09:15:43] [+  883.106s] STEP_START                     step=1/3 keyword=READFILE arg='cat /tmp/data.csv'
+[2026-04-28T09:15:43] [+  883.159s] STEP_DONE                      step=1 keyword=READFILE success=True output_len=4096
+[2026-04-28T09:15:43] [+  883.160s] STEP_START                     step=2/3 keyword=PROMPT arg='Analyze the data'
+[2026-04-28T09:15:43] [+  883.161s] STEP_LLM_REQUEST               step=2 keyword=PROMPT prompt_len=4210
+[2026-04-28T09:15:43] [+  883.162s] STREAM_CONNECT                 model=batiai/qwen3.6-35b:q3 read_timeout=300.0s
+[2026-04-28T09:16:04] [+  904.003s] STREAM_FIRST_CHUNK             model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:16:04] [+  904.004s] STEP_FIRST_TOKEN               step=2 keyword=PROMPT
+[2026-04-28T09:16:09] [+  909.872s] STREAM_DONE                    model=batiai/qwen3.6-35b:q3 tokens_in=512 tokens_out=1024
+[2026-04-28T09:16:09] [+  909.873s] STEP_LLM_DONE                  step=2 keyword=PROMPT response_len=3812
+```
+
+### Key events and what they mean
+
+| Event | What it tells you |
+|-------|------------------|
+| `STREAM_CONNECT` | HTTP request sent to Ollama. The gap to `STREAM_FIRST_CHUNK` is time-to-first-token (TTFT). |
+| `STREAM_FIRST_CHUNK` | First token received — model is no longer "thinking". |
+| `PLAN_FIRST_TOKEN` | First planning token received. Long gap from `PLAN_START` = slow planner. |
+| `PLAN_DONE` | Planning complete. `response_len=0` means the model returned nothing. |
+| `PLAN_EXEC_START` | Execution phase begins. |
+| `STEP_START` | A step is about to run. |
+| `STEP_LLM_REQUEST` | PROMPT or GENCODE dispatched to the analysis LLM. |
+| `STEP_FIRST_TOKEN` | First token of the PROMPT/GENCODE response received. |
+| `STEP_LLM_DONE` | PROMPT/GENCODE response complete. |
+| `STEP_DONE success=False` | A step failed — see `error=` field for reason. |
+| `STEP_SKIPPED` | Step was skipped (dry-run or user denied). |
+
+### Adjusting the stream timeout
+
+The default timeout of 120 seconds applies per text token gap (not per full
+response). Thinking models that are silent during reasoning will hit this limit
+if they think for more than 2 minutes without emitting a token.
+
+```bash
+# Even tighter — abort after 30s of silence
+aicli --stream-timeout 30 ...
+
+# Patient mode for slow hardware (10-minute budget)
+aicli --stream-timeout 600 ...
+
+# No timeout at all (not recommended — hangs indefinitely on network issues)
+aicli --stream-timeout 0 ...
+```
 
 ---
 
 ## Examples
 
-### Generate and write a file
+### Analyze a data file and write a report
 
 ```bash
-echo "Write a Python script to /tmp/hello.py that prints 'Hello, World!'" | \
-  aicli --model ollama/glm-4.7-flash:latest \
-        --include-directories /tmp \
-        --auto-approve
+echo "Read /tmp/data.csv, analyze for anomalies, write report to /tmp/report.md" | \
+  aicli --model ollama/qwen3.5 --include-directories /tmp -y
 ```
 
-### Multi-action pipeline: write, make executable, run
+### See the plan before executing (dry-run)
 
 ```bash
-echo "Create /tmp/greet.sh that echoes 'aicli works!', make it executable, then run it." | \
-  aicli --model ollama/glm-4.7-flash:latest \
-        --include-directories /tmp \
-        --allow-exec \
-        --auto-approve
+aicli --model ollama/qwen3.5 \
+      --prompt-file prompts/analyze-sar.md \
+      --include-directories ~/oracle-hc \
+      --dry-run
 ```
 
-### Analyse an existing project
+### Generate a gnuplot chart from SAR data
 
 ```bash
-aicli --model ollama/glm-4.7-flash:latest \
-      --prompt-file prompts/analyze.md
-# reads are always allowed; no --include-directories needed for read-only work
-```
-
-### Pipe mode — non-interactive batch job
-
-```bash
-cat <<'EOF' | aicli --model ollama/glm-4.7-flash:latest \
-                    --include-directories ~/reports \
-                    --allow-exec -y
-Read /var/log/syslog (last 100 lines), identify any ERROR entries,
-and write a summary to ~/reports/syslog-errors.md.
-EOF
-```
-
-### Interactive REPL with conversation history
-
-```bash
-aicli --model ollama/glm-4.7-flash:latest \
-      --include-directories ~/project \
-      --allow-exec
-# aicli> What is in ~/project?
-# aicli> Read the main Python file and explain it.
-# aicli> Add a docstring to the main() function and save it.
-# aicli> exit
-```
-
-### Point at a remote Ollama host for one run
-
-```bash
-echo "What is 2+2?" | \
-  aicli --model ollama/qwen3.5:latest \
-        --api-base http://192.168.1.53:11434
-```
-
-### Custom system prompt
-
-```bash
-aicli --model ollama/glm-4.7-flash:latest \
-      --system-prompt "Always respond in British English. Never use American spellings." \
-      --include-directories ~/project
-```
-
-### Combine system prompt file with user prompt file
-
-```bash
-aicli --model ollama/glm-4.7-flash:latest \
-      --system-prompt-file prompts/oracle-hc-context.md \
-      --prompt-file prompts/generate-gnuplot.md \
-      --include-directories ~/oracle-hc/charts \
+aicli --model ollama/qwen3.5 \
+      --prompt-file prompts/sar-memory.md \
+      --include-directories ~/oracle-hc \
       --allow-exec -y
 ```
 
-### Session logging
+### Multi-model: plan with small model, analyze with large model
 
 ```bash
-aicli --model ollama/glm-4.7-flash:latest \
-      --include-directories ~/project \
-      --log-sessions
-# Logs written to ~/.local/share/aicli/logs/session_<timestamp>.log
+aicli --model ollama/qwen3.5 \
+      --analysis-model ollama/batiai/qwen3.6-35b:q4 \
+      --prompt-file prompts/full-hc-report.md \
+      --include-directories ~/oracle-hc \
+      --allow-exec -y
+```
+
+### Verbose mode — see substituted prompts
+
+```bash
+echo "Read /tmp/data.csv and write a summary to /tmp/summary.md" | \
+  aicli --model ollama/qwen3.5 --include-directories /tmp --verbose -y
+```
+
+### Interactive REPL
+
+```bash
+aicli --model ollama/qwen3.5 --include-directories ~/project
+# aicli> List the Python files in ~/project
+# aicli> Read src/main.py and explain what it does
+# aicli> Write a markdown summary of the project to ~/project/SUMMARY.md
+# aicli> exit
+```
+
+### Custom planner system prompt
+
+```bash
+aicli --model ollama/qwen3.5 \
+      --system-prompt-file prompts/custom-planner.md \
+      --prompt-file prompts/task.md \
+      --include-directories ~/project
+```
+
+### Trace a slow or hanging model
+
+```bash
+# Run with tracing and a 5-minute per-chunk timeout
+echo "Analyze /tmp/data.csv and write a report to /tmp/report.md" | \
+  aicli --model ollama/batiai/qwen3.6-35b:q3 \
+        --include-directories /tmp \
+        --trace /tmp/aicli.trace \
+        --stream-timeout 300 \
+        --auto-approve
+
+# In another terminal — watch as events arrive in real time
+tail -f /tmp/aicli.trace
+```
+
+### Abort immediately on any step failure
+
+```bash
+echo "Run the test suite and write a report" | \
+  aicli --model ollama/qwen3.5 \
+        --include-directories /tmp \
+        --allow-exec \
+        --on-error abort \
+        -y
 ```
 
 ---
 
 ## Testing
 
-### Run all tests
+### Run unit tests (no Ollama required)
 
 ```bash
-python3.11 -m pytest tests/ -v
+python -m pytest tests/test_parser.py tests/test_executor.py \
+                 tests/test_permissions.py tests/test_model_filter.py -v
 ```
 
-### Unit tests only (no live Ollama required)
+### Integration tests (requires Ollama)
 
 ```bash
-python3.11 -m pytest tests/test_parser.py tests/test_executor.py tests/test_permissions.py -v
+python -m pytest tests/test_drivers/test_ollama.py -v
 ```
 
-### Integration tests (requires Ollama at configured host)
+### Test the V2 parser directly
 
-```bash
-python3.11 -m pytest tests/test_drivers/test_ollama.py -v
+```python
+from aicli.core.plan_parser import parse_plan
+from aicli.core.result_store import ResultStore
+
+steps = parse_plan("READFILE: cat /tmp/data.csv\nPROMPT: Analyze this:\n{RESULT_OF_STEP_1}")
+for s in steps:
+    print(f"{s.number}. {s.keyword}: {s.arg}")
 ```
-
-The integration tests use `qwen3.5:latest` and only test basic streaming/listing,
-not full agentic round-trips. They run in about 10 seconds.
-
-### Test categories
-
-| File | Tests | Requires Ollama |
-|------|-------|----------------|
-| `tests/test_parser.py` | 22 — XML action blocks, `<function=...>` blocks, JSON code blocks | No |
-| `tests/test_executor.py` | 16 — file read/write/exec/search, permissions, None-path guard | No |
-| `tests/test_permissions.py` | 4 — symlink traversal, path traversal, multi-dir | No |
-| `tests/test_retry.py` | 19 — retry nudge content, `_prompt_implies_tool_use` | No |
-| `tests/test_model_filter.py` | 7 — `filter_models()`, fnmatch patterns, case-insensitivity | No |
-| `tests/test_cli_utils.py` | 3 — `_parse_model()`, Ollama namespace prefix handling | No |
-| `tests/test_drivers/test_ollama.py` | 4 — model list, streaming, system prompt | Yes |
 
 ---
 
@@ -578,35 +634,42 @@ not full agentic round-trips. They run in about 10 seconds.
 aicli/
 ├── pyproject.toml
 ├── README.md
-├── API.md
-├── ADD-LLM.md
+├── API.md                     # Internal API reference
+├── ADD-LLM.md                 # How to add a new driver
 ├── src/
 │   └── aicli/
-│       ├── cli.py              # Entry point: argument parsing, action loop, REPL
-│       ├── config.py           # Config file loading and merging
+│       ├── cli.py             # Entry point: arg parsing, run_task(), REPL
+│       ├── config.py          # Config file loading and merging
 │       ├── core/
-│       │   ├── actions.py      # Action schema (ActionType, ActionRequest, ActionResult)
-│       │   ├── parser.py       # XML action block parser (system-prompt fallback)
-│       │   ├── executor.py     # Action execution engine + permission enforcement
-│       │   ├── session.py      # Conversation history (multi-turn state)
-│       │   └── system_prompt.py # System prompt builders for each tool strategy
+│       │   ├── plan_parser.py     # Parses tagged step lists from LLM output
+│       │   ├── result_store.py    # Step result storage + {RESULT_OF_STEP_N} substitution
+│       │   ├── planner.py         # Sends task to LLM, returns plan text
+│       │   ├── orchestrator.py    # Executes plan steps, dispatches PROMPT/GENCODE
+│       │   ├── executor.py        # Low-level file I/O and shell execution
+│       │   ├── actions.py         # ActionType / ActionRequest / ActionResult schema
+│       │   ├── parser.py          # Legacy XML action block parser (kept for reference)
+│       │   ├── session.py         # Conversation history (multi-turn)
+│       │   ├── system_prompt.py   # Legacy system prompt builders
+│       │   └── system_prompts/
+│       │       └── default.md     # Built-in V2 planner system prompt
 │       ├── drivers/
-│       │   ├── base.py         # Abstract BaseDriver interface
-│       │   ├── ollama.py       # Ollama REST API driver (Phase 1)
-│       │   ├── gemini.py       # Google Generative AI driver (Phase 3 stub)
-│       │   ├── claude.py       # Anthropic API driver (Phase 3 stub)
-│       │   ├── openai.py       # OpenAI API driver (Phase 3 stub)
-│       │   └── registry.py     # Driver name → class lookup
+│       │   ├── base.py            # Abstract BaseDriver interface
+│       │   ├── ollama.py          # Ollama REST API driver
+│       │   ├── gemini.py          # Google Generative AI driver (Phase 3 stub)
+│       │   ├── claude.py          # Anthropic API driver (Phase 3 stub)
+│       │   ├── openai.py          # OpenAI API driver (Phase 3 stub)
+│       │   └── registry.py        # Driver name → class lookup
 │       └── output/
-│           ├── renderer.py     # Streaming output + rich Markdown rendering
-│           └── logger.py       # Session file logging
+│           ├── renderer.py        # Streaming output + rich Markdown + plan display
+│           ├── logger.py          # Session file logging
+│           └── tracer.py          # Timing trace writer (--trace; line-buffered, survives kill)
 └── tests/
-    ├── test_parser.py          # XML, <function=...>, and JSON code block parsers
-    ├── test_executor.py        # file ops, permissions, None-path guard
-    ├── test_permissions.py     # symlink/traversal enforcement
-    ├── test_retry.py           # retry nudge logic
-    ├── test_model_filter.py    # model_exclusions fnmatch filtering
-    ├── test_cli_utils.py       # _parse_model(), Ollama namespace handling
+    ├── test_parser.py
+    ├── test_executor.py
+    ├── test_permissions.py
+    ├── test_retry.py
+    ├── test_model_filter.py
+    ├── test_cli_utils.py
     └── test_drivers/
         └── test_ollama.py
 ```

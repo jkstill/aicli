@@ -6,16 +6,22 @@ falls back to system-prompt action block parsing.
 """
 
 import json
+import time
 from typing import Generator
 
 import httpx
 
 from ..core.actions import NATIVE_TOOL_SCHEMAS
+from ..output.tracer import trace
 from .base import BaseDriver, NativeToolCall, ResponseChunk
 
 _DEFAULT_BASE = "http://localhost:11434"
 _CHAT_PATH = "/api/chat"
 _TAGS_PATH = "/api/tags"
+
+# Seconds to wait for the next streamed chunk before giving up.
+# Thinking models can be silent for a long time; callers may override.
+DEFAULT_STREAM_READ_TIMEOUT = 120
 
 
 class OllamaDriver(BaseDriver):
@@ -24,6 +30,7 @@ class OllamaDriver(BaseDriver):
         self._model: str = ""
         self._options: dict = {}
         self._native_tools: bool | None = None  # None = not yet probed
+        self._stream_read_timeout: float = DEFAULT_STREAM_READ_TIMEOUT
 
     def configure(
         self,
@@ -31,11 +38,13 @@ class OllamaDriver(BaseDriver):
         api_key: str | None,
         model: str,
         options: dict | None = None,
+        stream_read_timeout: float = DEFAULT_STREAM_READ_TIMEOUT,
     ) -> None:
         self._base = (api_base or _DEFAULT_BASE).rstrip("/")
         self._model = model
         self._options = options or {}
         self._native_tools = None  # reset probe on reconfigure
+        self._stream_read_timeout = stream_read_timeout
 
     # ------------------------------------------------------------------
     # Capability detection
@@ -43,6 +52,7 @@ class OllamaDriver(BaseDriver):
 
     def _query_capabilities(self) -> tuple[bool, bool]:
         """Return (supports_tools, supports_thinking) from /api/show."""
+        trace("CAPABILITY_PROBE_START", f"model={self._model}")
         try:
             with httpx.Client(timeout=10) as client:
                 r = client.post(
@@ -50,10 +60,14 @@ class OllamaDriver(BaseDriver):
                     json={"name": self._model},
                 )
                 if r.status_code != 200:
+                    trace("CAPABILITY_PROBE_DONE", f"model={self._model} status={r.status_code} tools=False thinking=False")
                     return False, False
                 caps = r.json().get("capabilities", [])
-                return "tools" in caps, "thinking" in caps
-        except Exception:
+                tools, thinking = "tools" in caps, "thinking" in caps
+                trace("CAPABILITY_PROBE_DONE", f"model={self._model} tools={tools} thinking={thinking}")
+                return tools, thinking
+        except Exception as e:
+            trace("CAPABILITY_PROBE_ERROR", f"model={self._model} error={e}")
             return False, False
 
     def supports_native_tools(self) -> bool:
@@ -94,6 +108,7 @@ class OllamaDriver(BaseDriver):
         messages: list[dict],
         system_prompt: str = "",
         stream: bool = True,
+        use_tools: bool = True,
     ) -> Generator[ResponseChunk, None, None]:
         body: dict = {
             "model": self._model,
@@ -105,7 +120,7 @@ class OllamaDriver(BaseDriver):
         if self._options:
             body["options"] = self._options
 
-        if self.supports_native_tools():
+        if use_tools and self.supports_native_tools():
             body["tools"] = NATIVE_TOOL_SCHEMAS
             body["tool_choice"] = "required"
             # Disable thinking mode for tool calls: thinking leads to RLHF-driven
@@ -121,37 +136,69 @@ class OllamaDriver(BaseDriver):
     def _stream(self, body: dict) -> Generator[ResponseChunk, None, None]:
         native_tool_calls: list[NativeToolCall] = []
         tokens_in = tokens_out = 0
+        first_chunk = True
+        # Track time of last received TEXT token.  Thinking models keep the network
+        # connection alive with empty keepalive chunks, so httpx's read timeout never
+        # fires.  We enforce our own silence timeout at the application level.
+        last_text_time = time.monotonic()
+        timed_out = False
 
-        with httpx.Client(timeout=None) as client:
-            with client.stream("POST", f"{self._base}{_CHAT_PATH}", json=body) as resp:
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
+        # connect=10s, read=30s (just for network drops; text silence handled below)
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+        trace("STREAM_CONNECT", f"model={self._model} silence_timeout={self._stream_read_timeout}s")
 
-                    message = chunk.get("message", {})
-                    content = message.get("content", "")
-                    tool_calls = message.get("tool_calls", [])
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                with client.stream("POST", f"{self._base}{_CHAT_PATH}", json=body) as resp:
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
 
-                    if content:
-                        yield ResponseChunk(text=content)
+                        message = chunk.get("message", {})
+                        content = message.get("content", "")
+                        tool_calls = message.get("tool_calls", [])
 
-                    for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        native_tool_calls.append(
-                            NativeToolCall(
-                                name=fn.get("name", ""),
-                                params=fn.get("arguments", {}),
+                        if content:
+                            last_text_time = time.monotonic()
+                            if first_chunk:
+                                trace("STREAM_FIRST_CHUNK", f"model={self._model}")
+                                first_chunk = False
+                            yield ResponseChunk(text=content)
+                        elif self._stream_read_timeout > 0:
+                            # No text in this chunk (keepalive/thinking).  Check silence.
+                            elapsed = time.monotonic() - last_text_time
+                            if elapsed > self._stream_read_timeout:
+                                trace("STREAM_SILENCE_TIMEOUT",
+                                      f"model={self._model} elapsed={elapsed:.0f}s")
+                                timed_out = True
+                                break
+
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            native_tool_calls.append(
+                                NativeToolCall(
+                                    name=fn.get("name", ""),
+                                    params=fn.get("arguments", {}),
+                                )
                             )
-                        )
 
-                    if chunk.get("done"):
-                        tokens_in = chunk.get("prompt_eval_count", 0)
-                        tokens_out = chunk.get("eval_count", 0)
+                        if chunk.get("done"):
+                            tokens_in = chunk.get("prompt_eval_count", 0)
+                            tokens_out = chunk.get("eval_count", 0)
+                            trace("STREAM_DONE",
+                                  f"model={self._model} tokens_in={tokens_in} tokens_out={tokens_out}")
+
+        except (httpx.ReadTimeout, httpx.TimeoutException) as e:
+            trace("STREAM_NETWORK_TIMEOUT", f"model={self._model} error={e}")
+            timed_out = True
+
+        if timed_out:
+            trace("STREAM_ABORTED", f"model={self._model}")
 
         yield ResponseChunk(
             done=True,
