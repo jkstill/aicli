@@ -21,7 +21,7 @@ _TAGS_PATH = "/api/tags"
 
 # Seconds to wait for the next streamed chunk before giving up.
 # Thinking models can be silent for a long time; callers may override.
-DEFAULT_STREAM_READ_TIMEOUT = 600
+DEFAULT_STREAM_READ_TIMEOUT = 120
 
 
 class OllamaDriver(BaseDriver):

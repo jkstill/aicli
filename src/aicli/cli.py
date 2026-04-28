@@ -139,7 +139,7 @@ def run_task(
               help="What to do when a step fails: continue, abort, or ask (default: ask)")
 @click.option("--trace", "trace_file", default=None, metavar="FILE",
               help="Write timing trace to FILE (flushed immediately; useful for diagnosing hangs)")
-@click.option("--stream-timeout", "stream_timeout", default=600, show_default=True, type=float,
+@click.option("--stream-timeout", "stream_timeout", default=120, show_default=True, type=float,
               help="Seconds to wait for the next streamed token before aborting (0 = no limit)")
 def main(
     model,

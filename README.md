@@ -236,7 +236,7 @@ Options:
                                   immediately so the file is readable even
                                   if the process is killed mid-run
       --stream-timeout FLOAT      Seconds to wait for the next streamed token
-                                  before aborting (default: 600; 0 = no limit)
+                                  before aborting (default: 120; 0 = no limit)
   -h, --help                      Show this message and exit.
 ```
 
@@ -256,7 +256,7 @@ Options:
 | `--on-error` | `ask` | What to do when a step fails: `continue`, `abort`, or `ask`. |
 | `--system-prompt-file` | built-in | Replace the planner system prompt entirely. |
 | `--trace FILE` | off | Write a timing trace to FILE (see [Diagnosing Hangs](#diagnosing-hangs)). |
-| `--stream-timeout` | `600` | Seconds to wait for the next streamed token. Use `0` for no limit. |
+| `--stream-timeout` | `120` | Seconds to wait for the next streamed token. Use `0` for no limit. |
 
 ---
 
@@ -482,16 +482,16 @@ Each line is `[timestamp] [+elapsed_seconds] EVENT  details`:
 
 ### Adjusting the stream timeout
 
-The default timeout of 600 seconds applies per streamed chunk (not per full
+The default timeout of 120 seconds applies per text token gap (not per full
 response). Thinking models that are silent during reasoning will hit this limit
-if they think for more than 10 minutes without emitting a token.
+if they think for more than 2 minutes without emitting a token.
 
 ```bash
-# Shorter timeout for fast models (30s max silence)
+# Even tighter — abort after 30s of silence
 aicli --stream-timeout 30 ...
 
-# Very patient (20-minute budget per chunk)
-aicli --stream-timeout 1200 ...
+# Patient mode for slow hardware (10-minute budget)
+aicli --stream-timeout 600 ...
 
 # No timeout at all (not recommended — hangs indefinitely on network issues)
 aicli --stream-timeout 0 ...
