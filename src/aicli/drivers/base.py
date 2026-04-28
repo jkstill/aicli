@@ -44,9 +44,13 @@ class BaseDriver(ABC):
         messages: list[dict],
         system_prompt: str = "",
         stream: bool = True,
+        use_tools: bool = True,
     ) -> Generator[ResponseChunk, None, None]:
         """Yield ResponseChunk objects. The final chunk has done=True and may
-        carry native_tool_calls, token counts, and model metadata."""
+        carry native_tool_calls, token counts, and model metadata.
+
+        Pass use_tools=False to suppress native tool schemas (V2 planner mode).
+        """
         ...
 
     @abstractmethod

@@ -77,3 +77,24 @@ class Renderer:
             return answer in ("", "y", "yes")
         except (EOFError, KeyboardInterrupt):
             return False
+
+    # ------------------------------------------------------------------
+    # V2 planner/executor display
+    # ------------------------------------------------------------------
+
+    def print_plan(self, steps: list) -> None:
+        """Display the parsed plan before execution."""
+        header = f"Plan: {len(steps)} step(s)"
+        if self.markdown:
+            self._console.print(f"\n[bold cyan]{header}[/bold cyan]")
+            for step in steps:
+                save = f" → {step.save_path}" if step.save_path else ""
+                self._console.print(
+                    f"  [dim]{step.number:2}.[/dim] "
+                    f"[cyan]{step.keyword}[/cyan]: {step.arg[:70]}{save}"
+                )
+        else:
+            print(f"\n{header}")
+            for step in steps:
+                save = f" -> {step.save_path}" if step.save_path else ""
+                print(f"  {step.number:2}. {step.keyword}: {step.arg[:70]}{save}")

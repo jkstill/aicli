@@ -94,6 +94,7 @@ class OllamaDriver(BaseDriver):
         messages: list[dict],
         system_prompt: str = "",
         stream: bool = True,
+        use_tools: bool = True,
     ) -> Generator[ResponseChunk, None, None]:
         body: dict = {
             "model": self._model,
@@ -105,7 +106,7 @@ class OllamaDriver(BaseDriver):
         if self._options:
             body["options"] = self._options
 
-        if self.supports_native_tools():
+        if use_tools and self.supports_native_tools():
             body["tools"] = NATIVE_TOOL_SCHEMAS
             body["tool_choice"] = "required"
             # Disable thinking mode for tool calls: thinking leads to RLHF-driven

@@ -8,7 +8,7 @@ class ClaudeDriver(BaseDriver):
     def configure(self, api_base, api_key, model, options=None):
         raise NotImplementedError("Claude driver not yet implemented (Phase 3).")
 
-    def send(self, messages, system_prompt="", stream=True) -> Generator[ResponseChunk, None, None]:
+    def send(self, messages, system_prompt="", stream=True, use_tools=True) -> Generator[ResponseChunk, None, None]:
         raise NotImplementedError
 
     def list_models(self):
