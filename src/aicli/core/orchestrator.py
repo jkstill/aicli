@@ -47,6 +47,7 @@ class Orchestrator:
         verbose: bool = False,
         renderer: "Renderer | None" = None,
         exec_timeout: int = 300,
+        on_error: str = "ask",
     ) -> None:
         self._analysis = analysis_driver
         self._executor = Executor(allowed_dirs=allowed_dirs, allow_exec=allow_exec)
@@ -55,6 +56,7 @@ class Orchestrator:
         self._verbose = verbose
         self._renderer = renderer
         self._exec_timeout = exec_timeout
+        self._on_error = on_error  # "continue" | "abort" | "ask"
 
     # ------------------------------------------------------------------
     # Renderer helpers
@@ -274,6 +276,14 @@ class Orchestrator:
         final_output = ""
         total = len(steps)
 
+        # Warn early if the plan contains EXEC steps but --allow-exec is not set.
+        exec_steps = [s for s in steps if s.keyword == "EXEC"]
+        if exec_steps and not self._executor.allow_exec:
+            self._warn(
+                f"Plan contains {len(exec_steps)} EXEC step(s) but --allow-exec is not set. "
+                "Those steps will fail. Re-run with --allow-exec to enable execution."
+            )
+
         for step in steps:
             self._info(f"\n[{step.number}/{total}] {step.keyword}: {step.arg[:70]}")
 
@@ -311,12 +321,19 @@ class Orchestrator:
                     )
 
             if result.success:
-                self._info(f"  ✓ done")
+                self._info("  ✓ done")
                 store.store(step.number, result.output)
                 if step.keyword == "PROMPT":
                     final_output = result.output
             else:
                 self._error(f"  ✗ {result.error}")
                 store.store(step.number, f"[Step {step.number} failed: {result.error}]")
+                if self._on_error == "abort":
+                    self._error("Aborting plan execution after step failure.")
+                    return final_output
+                elif self._on_error == "ask" and not self._auto_approve:
+                    if not self._confirm("  Step failed. Continue with remaining steps?"):
+                        self._info("Execution aborted by user.")
+                        return final_output
 
         return final_output

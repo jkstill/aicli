@@ -47,6 +47,7 @@ def run_task(
     renderer: Renderer,
     logger: SessionLogger,
     exec_timeout: int = 300,
+    on_error: str = "ask",
 ) -> None:
     """Run one task: plan → parse → execute."""
     logger.log("user", task)
@@ -94,6 +95,7 @@ def run_task(
         verbose=verbose,
         renderer=renderer,
         exec_timeout=exec_timeout,
+        on_error=on_error,
     )
 
     final_output = orchestrator.run(steps)
@@ -130,6 +132,10 @@ def run_task(
 @click.option("--api-key", "api_key", default=None, help="Override driver API key")
 @click.option("--log-sessions", "log_sessions", is_flag=True, default=False,
               help="Log session to file")
+@click.option("--on-error", "on_error",
+              type=click.Choice(["continue", "abort", "ask"], case_sensitive=False),
+              default="ask",
+              help="What to do when a step fails: continue, abort, or ask (default: ask)")
 def main(
     model,
     analysis_model,
@@ -145,6 +151,7 @@ def main(
     api_base,
     api_key,
     log_sessions,
+    on_error,
 ):
     """aicli v2 — planner/executor CLI for large language models.
 
@@ -203,7 +210,7 @@ def main(
             run_task(
                 task, planner_driver, analysis_driver,
                 allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
-                system_prompt, renderer, logger, exec_timeout,
+                system_prompt, renderer, logger, exec_timeout, on_error,
             )
         logger.close()
         return
@@ -214,7 +221,7 @@ def main(
         run_task(
             task, planner_driver, analysis_driver,
             allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
-            system_prompt, renderer, logger, exec_timeout,
+            system_prompt, renderer, logger, exec_timeout, on_error,
         )
         logger.close()
         return
@@ -243,7 +250,7 @@ def main(
         run_task(
             task, planner_driver, analysis_driver,
             allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
-            system_prompt, renderer, logger, exec_timeout,
+            system_prompt, renderer, logger, exec_timeout, on_error,
         )
 
     logger.close()
