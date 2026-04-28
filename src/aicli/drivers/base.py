@@ -36,6 +36,7 @@ class BaseDriver(ABC):
         api_key: str | None,
         model: str,
         options: dict | None = None,
+        stream_read_timeout: float = 600,
     ) -> None: ...
 
     @abstractmethod

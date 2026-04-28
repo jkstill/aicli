@@ -56,8 +56,9 @@ Driven by real model test runs.
 | P.8 | GENCODE: `→ /path` / `-> /path` embedded path extraction | ✅ | |
 | P.9 | `[KEYWORD]` bracket format (glm-4.7-flash) | ✅ | |
 | P.10 | Bare `KEYWORD` with no separator | ✅ | |
-| P.11 | Thinking-mode timeout (batiai/qwen3.6-35b:q3 takes 18 min) | ⬜ | Add stream timeout or `/no_think` flag |
-| P.12 | Re-run model compatibility test after prompt + parser changes | ⬜ | Run test-models script; update notes |
+| P.11 | Thinking-mode timeout (batiai/qwen3.6-35b:q3 takes 18 min) | ✅ | `--stream-timeout` (default 600s) via httpx.Timeout(read=…) |
+| P.12 | Trace logging for hang diagnosis | ✅ | `--trace FILE` with line-buffered output; survives kill/Ctrl-C |
+| P.13 | Re-run model compatibility test after prompt + parser changes | ⬜ | Run test-models script; update notes |
 
 ---
 
@@ -106,9 +107,8 @@ Driven by real model test runs.
 
 ## Next Up (recommended order)
 
-1. ⬜ P.11 — Handle thinking-mode timeout
-2. ⬜ P.12 — Re-run model compatibility test
-3. ⬜ 2.8  — Validate session logging end-to-end
-4. ⬜ 3.2  — Gemini driver
-5. ⬜ 3.3  — Claude driver
-6. ⬜ 3.4  — OpenAI driver
+1. ⬜ P.13 — Re-run model compatibility test (use `--trace` to capture timing)
+2. ⬜ 2.8  — Validate session logging end-to-end
+3. ⬜ 3.2  — Gemini driver
+4. ⬜ 3.3  — Claude driver
+5. ⬜ 3.4  — OpenAI driver

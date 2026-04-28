@@ -138,6 +138,9 @@ def _make_step(number: int, keyword: str, arg: str, body_lines: list[str]) -> Pl
             m = _WRITEFILE_PATH_RE.match(arg.strip())
             if m:
                 arg = m.group(1).strip()
+            else:
+                # Strip surrounding quotes that some models add: "/tmp/out.md" → /tmp/out.md
+                arg = arg.strip().strip("\"'")
 
         case "GENCODE":
             # Try SAVEAS from body first

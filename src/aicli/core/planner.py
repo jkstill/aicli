@@ -3,6 +3,8 @@
 from pathlib import Path
 from typing import Callable
 
+from ..output.tracer import trace
+
 _DEFAULT_PROMPT = Path(__file__).parent / "system_prompts" / "default.md"
 
 
@@ -35,6 +37,8 @@ class Planner:
         )
         messages = [{"role": "user", "content": content}]
         text = ""
+        first = True
+        trace("PLAN_START", f"task_len={len(task)}")
         for chunk in self._driver.send(
             messages,
             system_prompt=self._system_prompt,
@@ -44,7 +48,11 @@ class Planner:
             if chunk.done:
                 break
             if chunk.text:
+                if first:
+                    trace("PLAN_FIRST_TOKEN")
+                    first = False
                 text += chunk.text
                 if stream_callback:
                     stream_callback(chunk.text)
+        trace("PLAN_DONE", f"response_len={len(text)}")
         return text

@@ -56,6 +56,7 @@ Architecture (DBI/DBD pattern):
 - [Multi-Model Pipelines](#multi-model-pipelines)
 - [Model Selection](#model-selection)
 - [Model Compatibility](#model-compatibility)
+- [Diagnosing Hangs](#diagnosing-hangs)
 - [Examples](#examples)
 - [Testing](#testing)
 - [Project Layout](#project-layout)
@@ -229,6 +230,13 @@ Options:
       --api-base TEXT             Override driver API base URL
       --api-key TEXT              Override driver API key
       --log-sessions              Write session log to file
+      --on-error [continue|abort|ask]
+                                  What to do on step failure (default: ask)
+      --trace FILE                Write timing trace to FILE; flushed
+                                  immediately so the file is readable even
+                                  if the process is killed mid-run
+      --stream-timeout FLOAT      Seconds to wait for the next streamed token
+                                  before aborting (default: 600; 0 = no limit)
   -h, --help                      Show this message and exit.
 ```
 
@@ -245,7 +253,10 @@ Options:
 | `--verbose` | off | Show full substituted prompts and step details while executing. |
 | `--no-markdown` | off | Print raw text instead of rich-rendered Markdown. |
 | `--log-sessions` | off | Append full logs to `~/.local/share/aicli/logs/session_<ts>.log`. |
+| `--on-error` | `ask` | What to do when a step fails: `continue`, `abort`, or `ask`. |
 | `--system-prompt-file` | built-in | Replace the planner system prompt entirely. |
+| `--trace FILE` | off | Write a timing trace to FILE (see [Diagnosing Hangs](#diagnosing-hangs)). |
+| `--stream-timeout` | `600` | Seconds to wait for the next streamed token. Use `0` for no limit. |
 
 ---
 
@@ -404,6 +415,90 @@ The plan parser tolerates common model output variations:
 
 ---
 
+## Diagnosing Hangs
+
+Large or thinking-mode models (e.g. `batiai/qwen3.6-35b:q3`) can be silent for
+many minutes before emitting a single token. Use `--trace` to see exactly where
+time is being spent and `--stream-timeout` to set an upper bound.
+
+### Enable tracing
+
+```bash
+echo "my task" | aicli \
+  --model ollama/batiai/qwen3.6-35b:q3 \
+  --include-directories /tmp \
+  --trace /tmp/aicli.trace \
+  --stream-timeout 300 \
+  -y
+```
+
+In a second terminal, tail the trace file while the run is in progress:
+
+```bash
+tail -f /tmp/aicli.trace
+```
+
+### Reading the trace
+
+Each line is `[timestamp] [+elapsed_seconds] EVENT  details`:
+
+```
+[2026-04-28T09:01:00] [+    0.001s] CLI_START                      model=None stream_timeout=300.0s
+[2026-04-28T09:01:00] [+    0.042s] CAPABILITY_PROBE_START         model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:01:00] [+    0.089s] CAPABILITY_PROBE_DONE          model=batiai/qwen3.6-35b:q3 tools=False thinking=True
+[2026-04-28T09:01:00] [+    0.091s] TASK_START                     mode=pipe task_len=58
+[2026-04-28T09:01:00] [+    0.092s] PLAN_START                     task_len=58
+[2026-04-28T09:01:00] [+    0.094s] STREAM_CONNECT                 model=batiai/qwen3.6-35b:q3 read_timeout=300.0s
+[2026-04-28T09:15:42] [+  882.341s] STREAM_FIRST_CHUNK             model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:15:42] [+  882.342s] PLAN_FIRST_TOKEN
+[2026-04-28T09:15:43] [+  883.104s] PLAN_DONE                      response_len=312
+[2026-04-28T09:15:43] [+  883.105s] PLAN_EXEC_START                total_steps=3
+[2026-04-28T09:15:43] [+  883.106s] STEP_START                     step=1/3 keyword=READFILE arg='cat /tmp/data.csv'
+[2026-04-28T09:15:43] [+  883.159s] STEP_DONE                      step=1 keyword=READFILE success=True output_len=4096
+[2026-04-28T09:15:43] [+  883.160s] STEP_START                     step=2/3 keyword=PROMPT arg='Analyze the data'
+[2026-04-28T09:15:43] [+  883.161s] STEP_LLM_REQUEST               step=2 keyword=PROMPT prompt_len=4210
+[2026-04-28T09:15:43] [+  883.162s] STREAM_CONNECT                 model=batiai/qwen3.6-35b:q3 read_timeout=300.0s
+[2026-04-28T09:16:04] [+  904.003s] STREAM_FIRST_CHUNK             model=batiai/qwen3.6-35b:q3
+[2026-04-28T09:16:04] [+  904.004s] STEP_FIRST_TOKEN               step=2 keyword=PROMPT
+[2026-04-28T09:16:09] [+  909.872s] STREAM_DONE                    model=batiai/qwen3.6-35b:q3 tokens_in=512 tokens_out=1024
+[2026-04-28T09:16:09] [+  909.873s] STEP_LLM_DONE                  step=2 keyword=PROMPT response_len=3812
+```
+
+### Key events and what they mean
+
+| Event | What it tells you |
+|-------|------------------|
+| `STREAM_CONNECT` | HTTP request sent to Ollama. The gap to `STREAM_FIRST_CHUNK` is time-to-first-token (TTFT). |
+| `STREAM_FIRST_CHUNK` | First token received — model is no longer "thinking". |
+| `PLAN_FIRST_TOKEN` | First planning token received. Long gap from `PLAN_START` = slow planner. |
+| `PLAN_DONE` | Planning complete. `response_len=0` means the model returned nothing. |
+| `PLAN_EXEC_START` | Execution phase begins. |
+| `STEP_START` | A step is about to run. |
+| `STEP_LLM_REQUEST` | PROMPT or GENCODE dispatched to the analysis LLM. |
+| `STEP_FIRST_TOKEN` | First token of the PROMPT/GENCODE response received. |
+| `STEP_LLM_DONE` | PROMPT/GENCODE response complete. |
+| `STEP_DONE success=False` | A step failed — see `error=` field for reason. |
+| `STEP_SKIPPED` | Step was skipped (dry-run or user denied). |
+
+### Adjusting the stream timeout
+
+The default timeout of 600 seconds applies per streamed chunk (not per full
+response). Thinking models that are silent during reasoning will hit this limit
+if they think for more than 10 minutes without emitting a token.
+
+```bash
+# Shorter timeout for fast models (30s max silence)
+aicli --stream-timeout 30 ...
+
+# Very patient (20-minute budget per chunk)
+aicli --stream-timeout 1200 ...
+
+# No timeout at all (not recommended — hangs indefinitely on network issues)
+aicli --stream-timeout 0 ...
+```
+
+---
+
 ## Examples
 
 ### Analyze a data file and write a report
@@ -465,6 +560,32 @@ aicli --model ollama/qwen3.5 \
       --system-prompt-file prompts/custom-planner.md \
       --prompt-file prompts/task.md \
       --include-directories ~/project
+```
+
+### Trace a slow or hanging model
+
+```bash
+# Run with tracing and a 5-minute per-chunk timeout
+echo "Analyze /tmp/data.csv and write a report to /tmp/report.md" | \
+  aicli --model ollama/batiai/qwen3.6-35b:q3 \
+        --include-directories /tmp \
+        --trace /tmp/aicli.trace \
+        --stream-timeout 300 \
+        --auto-approve
+
+# In another terminal — watch as events arrive in real time
+tail -f /tmp/aicli.trace
+```
+
+### Abort immediately on any step failure
+
+```bash
+echo "Run the test suite and write a report" | \
+  aicli --model ollama/qwen3.5 \
+        --include-directories /tmp \
+        --allow-exec \
+        --on-error abort \
+        -y
 ```
 
 ---
@@ -530,7 +651,8 @@ aicli/
 │       │   └── registry.py        # Driver name → class lookup
 │       └── output/
 │           ├── renderer.py        # Streaming output + rich Markdown + plan display
-│           └── logger.py          # Session file logging
+│           ├── logger.py          # Session file logging
+│           └── tracer.py          # Timing trace writer (--trace; line-buffered, survives kill)
 └── tests/
     ├── test_parser.py
     ├── test_executor.py

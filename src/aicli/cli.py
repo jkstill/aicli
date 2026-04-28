@@ -13,6 +13,7 @@ from .core.planner import Planner, load_system_prompt
 from .drivers.registry import get_driver, list_drivers
 from .output.logger import SessionLogger
 from .output.renderer import Renderer
+from .output.tracer import close_tracer, init_tracer, trace
 
 
 def _parse_model(model_str: str) -> tuple[str, str]:
@@ -25,12 +26,12 @@ def _parse_model(model_str: str) -> tuple[str, str]:
     return "ollama", model_str
 
 
-def _setup_driver(driver_name: str, model_name: str, config: dict, api_base=None, api_key=None):
+def _setup_driver(driver_name: str, model_name: str, config: dict, api_base=None, api_key=None, stream_timeout: float = 600):
     driver = get_driver(driver_name)
     dcfg = driver_config(config, driver_name)
     effective_base = api_base or dcfg.get("api_base", "")
     effective_key = api_key or resolve_api_key(dcfg)
-    driver.configure(effective_base, effective_key, model_name)
+    driver.configure(effective_base, effective_key, model_name, stream_read_timeout=stream_timeout)
     return driver
 
 
@@ -136,6 +137,10 @@ def run_task(
               type=click.Choice(["continue", "abort", "ask"], case_sensitive=False),
               default="ask",
               help="What to do when a step fails: continue, abort, or ask (default: ask)")
+@click.option("--trace", "trace_file", default=None, metavar="FILE",
+              help="Write timing trace to FILE (flushed immediately; useful for diagnosing hangs)")
+@click.option("--stream-timeout", "stream_timeout", default=600, show_default=True, type=float,
+              help="Seconds to wait for the next streamed token before aborting (0 = no limit)")
 def main(
     model,
     analysis_model,
@@ -152,29 +157,53 @@ def main(
     api_key,
     log_sessions,
     on_error,
+    trace_file,
+    stream_timeout,
 ):
     """aicli v2 — planner/executor CLI for large language models.
 
     The LLM decomposes your task into discrete steps. The framework executes
     mechanical steps (file I/O, shell commands) and dispatches analytical steps
     (PROMPT, GENCODE) back to the LLM.
+
+    \b
+    Diagnosing hangs with --trace:
+
+      # Run with trace enabled
+      echo "my task" | aicli --model ollama/qwen3.5 --trace /tmp/aicli.trace -y
+
+      # While it runs (or after aborting), tail the trace:
+      tail -f /tmp/aicli.trace
+
+      # Key events to look for:
+      #   PLAN_START          → planning request sent to LLM
+      #   STREAM_FIRST_CHUNK  → first token received (long gap = slow model)
+      #   PLAN_FIRST_TOKEN    → first planning token (after thinking finishes)
+      #   STEP_LLM_REQUEST    → PROMPT/GENCODE dispatched to analysis LLM
+      #   STEP_FIRST_TOKEN    → first token of PROMPT/GENCODE response
     """
     config = load_config()
+
+    # --- Tracing ---
+    effective_timeout = stream_timeout if stream_timeout > 0 else float("inf")
+    init_tracer(trace_file)
+    trace("CLI_START", f"model={model} stream_timeout={effective_timeout}s trace={trace_file}")
 
     # --- Resolve planner model ---
     model = model or config.get("model", "ollama/qwen3.5")
     planner_name, planner_model = _parse_model(model)
-    planner_driver = _setup_driver(planner_name, planner_model, config, api_base, api_key)
+    planner_driver = _setup_driver(planner_name, planner_model, config, api_base, api_key, effective_timeout)
 
     if list_models:
         for name in filter_models(planner_driver.list_models(), config):
             click.echo(name)
+        close_tracer()
         return
 
     # --- Resolve analysis model (defaults to planner) ---
     if analysis_model:
         analysis_name, analysis_model_name = _parse_model(analysis_model)
-        analysis_driver = _setup_driver(analysis_name, analysis_model_name, config, api_base, api_key)
+        analysis_driver = _setup_driver(analysis_name, analysis_model_name, config, api_base, api_key, effective_timeout)
     else:
         analysis_driver = planner_driver
         analysis_name = planner_name
@@ -207,23 +236,29 @@ def main(
     if not sys.stdin.isatty() and not prompt_file:
         task = sys.stdin.read().strip()
         if task:
+            trace("TASK_START", f"mode=pipe task_len={len(task)}")
             run_task(
                 task, planner_driver, analysis_driver,
                 allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
                 system_prompt, renderer, logger, exec_timeout, on_error,
             )
+            trace("TASK_DONE", "mode=pipe")
         logger.close()
+        close_tracer()
         return
 
     # --- File mode ---
     if prompt_file:
         task = Path(prompt_file).read_text().strip()
+        trace("TASK_START", f"mode=file task_len={len(task)}")
         run_task(
             task, planner_driver, analysis_driver,
             allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
             system_prompt, renderer, logger, exec_timeout, on_error,
         )
+        trace("TASK_DONE", "mode=file")
         logger.close()
+        close_tracer()
         return
 
     # --- Interactive REPL ---
@@ -231,6 +266,7 @@ def main(
 
     def _sigint(sig, frame):
         print()
+        close_tracer()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, _sigint)
@@ -247,13 +283,16 @@ def main(
         if task.lower() in ("exit", "quit", "q"):
             break
 
+        trace("TASK_START", f"mode=repl task_len={len(task)}")
         run_task(
             task, planner_driver, analysis_driver,
             allowed_dirs, allow_exec, auto_approve, dry_run, verbose,
             system_prompt, renderer, logger, exec_timeout, on_error,
         )
+        trace("TASK_DONE", "mode=repl")
 
     logger.close()
+    close_tracer()
 
 
 if __name__ == "__main__":

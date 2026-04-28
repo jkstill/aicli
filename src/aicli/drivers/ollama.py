@@ -11,11 +11,16 @@ from typing import Generator
 import httpx
 
 from ..core.actions import NATIVE_TOOL_SCHEMAS
+from ..output.tracer import trace
 from .base import BaseDriver, NativeToolCall, ResponseChunk
 
 _DEFAULT_BASE = "http://localhost:11434"
 _CHAT_PATH = "/api/chat"
 _TAGS_PATH = "/api/tags"
+
+# Seconds to wait for the next streamed chunk before giving up.
+# Thinking models can be silent for a long time; callers may override.
+DEFAULT_STREAM_READ_TIMEOUT = 600
 
 
 class OllamaDriver(BaseDriver):
@@ -24,6 +29,7 @@ class OllamaDriver(BaseDriver):
         self._model: str = ""
         self._options: dict = {}
         self._native_tools: bool | None = None  # None = not yet probed
+        self._stream_read_timeout: float = DEFAULT_STREAM_READ_TIMEOUT
 
     def configure(
         self,
@@ -31,11 +37,13 @@ class OllamaDriver(BaseDriver):
         api_key: str | None,
         model: str,
         options: dict | None = None,
+        stream_read_timeout: float = DEFAULT_STREAM_READ_TIMEOUT,
     ) -> None:
         self._base = (api_base or _DEFAULT_BASE).rstrip("/")
         self._model = model
         self._options = options or {}
         self._native_tools = None  # reset probe on reconfigure
+        self._stream_read_timeout = stream_read_timeout
 
     # ------------------------------------------------------------------
     # Capability detection
@@ -43,6 +51,7 @@ class OllamaDriver(BaseDriver):
 
     def _query_capabilities(self) -> tuple[bool, bool]:
         """Return (supports_tools, supports_thinking) from /api/show."""
+        trace("CAPABILITY_PROBE_START", f"model={self._model}")
         try:
             with httpx.Client(timeout=10) as client:
                 r = client.post(
@@ -50,10 +59,14 @@ class OllamaDriver(BaseDriver):
                     json={"name": self._model},
                 )
                 if r.status_code != 200:
+                    trace("CAPABILITY_PROBE_DONE", f"model={self._model} status={r.status_code} tools=False thinking=False")
                     return False, False
                 caps = r.json().get("capabilities", [])
-                return "tools" in caps, "thinking" in caps
-        except Exception:
+                tools, thinking = "tools" in caps, "thinking" in caps
+                trace("CAPABILITY_PROBE_DONE", f"model={self._model} tools={tools} thinking={thinking}")
+                return tools, thinking
+        except Exception as e:
+            trace("CAPABILITY_PROBE_ERROR", f"model={self._model} error={e}")
             return False, False
 
     def supports_native_tools(self) -> bool:
@@ -122,8 +135,13 @@ class OllamaDriver(BaseDriver):
     def _stream(self, body: dict) -> Generator[ResponseChunk, None, None]:
         native_tool_calls: list[NativeToolCall] = []
         tokens_in = tokens_out = 0
+        first_chunk = True
 
-        with httpx.Client(timeout=None) as client:
+        # connect=10s, read=configurable (thinking models can be silent for minutes)
+        timeout = httpx.Timeout(connect=10.0, read=self._stream_read_timeout, write=10.0, pool=10.0)
+        trace("STREAM_CONNECT", f"model={self._model} read_timeout={self._stream_read_timeout}s")
+
+        with httpx.Client(timeout=timeout) as client:
             with client.stream("POST", f"{self._base}{_CHAT_PATH}", json=body) as resp:
                 resp.raise_for_status()
                 for raw_line in resp.iter_lines():
@@ -139,6 +157,9 @@ class OllamaDriver(BaseDriver):
                     tool_calls = message.get("tool_calls", [])
 
                     if content:
+                        if first_chunk:
+                            trace("STREAM_FIRST_CHUNK", f"model={self._model}")
+                            first_chunk = False
                         yield ResponseChunk(text=content)
 
                     for tc in tool_calls:
@@ -153,6 +174,7 @@ class OllamaDriver(BaseDriver):
                     if chunk.get("done"):
                         tokens_in = chunk.get("prompt_eval_count", 0)
                         tokens_out = chunk.get("eval_count", 0)
+                        trace("STREAM_DONE", f"model={self._model} tokens_in={tokens_in} tokens_out={tokens_out}")
 
         yield ResponseChunk(
             done=True,

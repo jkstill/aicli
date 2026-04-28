@@ -95,3 +95,55 @@ def test_overwrite_step_result():
     rs.store(1, "original")
     rs.store(1, "overwritten")
     assert rs.get(1) == "overwritten"
+
+
+# ---------------------------------------------------------------------------
+# store_failure / latest_success
+# ---------------------------------------------------------------------------
+
+def test_store_failure_excluded_from_latest_success():
+    rs = ResultStore()
+    rs.store(1, "good output")
+    rs.store_failure(2, "[Step 2 failed: GENCODE step is missing a SAVEAS: line.]")
+    assert rs.latest_success() == "good output"
+
+
+def test_latest_success_empty_when_all_failed():
+    rs = ResultStore()
+    rs.store_failure(1, "[Step 1 failed: something]")
+    assert rs.latest_success() == ""
+
+
+def test_latest_success_skips_failure_between_successes():
+    rs = ResultStore()
+    rs.store(1, "first good")
+    rs.store_failure(2, "[Step 2 failed]")
+    rs.store(3, "third good")
+    assert rs.latest_success() == "third good"
+
+
+def test_latest_still_returns_failure_placeholder():
+    """latest() should still return failure placeholders (for explicit refs)."""
+    rs = ResultStore()
+    rs.store(1, "good")
+    rs.store_failure(2, "[Step 2 failed]")
+    assert rs.latest() == "[Step 2 failed]"
+
+
+def test_failure_accessible_via_get():
+    rs = ResultStore()
+    rs.store_failure(1, "[Step 1 failed: oops]")
+    assert rs.get(1) == "[Step 1 failed: oops]"
+
+
+def test_writefile_quoted_arg_stripped():
+    """Parser strips surrounding quotes from WRITEFILE path arg."""
+    from aicli.core.plan_parser import parse_plan
+    steps = parse_plan('WRITEFILE: "/tmp/out.md"\nhello')
+    assert steps[0].arg == "/tmp/out.md"
+
+
+def test_writefile_single_quoted_arg_stripped():
+    from aicli.core.plan_parser import parse_plan
+    steps = parse_plan("WRITEFILE: '/tmp/out.md'\nhello")
+    assert steps[0].arg == "/tmp/out.md"

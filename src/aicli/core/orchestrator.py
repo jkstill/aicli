@@ -14,6 +14,7 @@ from .executor import Executor
 from .executor import PermissionError as ExecPermissionError
 from .plan_parser import PlanStep
 from .result_store import ResultStore
+from ..output.tracer import trace
 
 if TYPE_CHECKING:
     from ..output.renderer import Renderer
@@ -131,9 +132,11 @@ class Orchestrator:
     def _exec_writefile(self, step: PlanStep, store: ResultStore) -> StepResult:
         path = store.substitute(step.arg)
         body = step.body
-        # Auto-inject the latest step result if the body is empty.
+        # Auto-inject the latest SUCCESSFUL step result if the body is empty.
+        # latest_success() skips failure placeholders so a preceding GENCODE
+        # failure doesn't overwrite the file with "[Step N failed: ...]".
         if not body.strip():
-            body = store.latest()
+            body = store.latest_success()
         content = store.substitute(body)
         req = ActionRequest(
             action_type=ActionType.WRITE_FILE,
@@ -188,11 +191,11 @@ class Orchestrator:
         if step.body:
             raw = (raw + "\n" + step.body) if raw else step.body
 
-        # Auto-inject the most recent step result if no explicit references present.
-        # This handles models that generate PROMPT steps without {RESULT_OF_STEP_N}.
+        # Auto-inject the most recent SUCCESSFUL step result if no explicit ref.
+        # Uses latest_success() so a preceding failure placeholder is not injected.
         ref_pattern = re.compile(r"\{RESULT_OF_", re.IGNORECASE)
         if not ref_pattern.search(raw):
-            prev = store.latest()
+            prev = store.latest_success()
             if prev:
                 raw = raw + "\n\nData:\n" + prev
 
@@ -203,19 +206,25 @@ class Orchestrator:
             self._info(f"    prompt: {preview}...")
 
         text = ""
+        first_token = True
 
         def on_chunk(t: str) -> None:
-            nonlocal text
+            nonlocal text, first_token
+            if first_token:
+                trace("STEP_FIRST_TOKEN", f"step={step.number} keyword=PROMPT")
+                first_token = False
             text += t
             if self._renderer:
                 self._renderer.stream_chunk(t)
 
+        trace("STEP_LLM_REQUEST", f"step={step.number} keyword=PROMPT prompt_len={len(prompt_text)}")
         self._collect_text(
             [{"role": "user", "content": prompt_text}],
             stream_callback=on_chunk,
         )
         if self._renderer:
             self._renderer.finalize()
+        trace("STEP_LLM_DONE", f"step={step.number} keyword=PROMPT response_len={len(text)}")
 
         return StepResult(success=True, output=text)
 
@@ -235,13 +244,18 @@ class Orchestrator:
             "Output raw code only. No explanatory text. No markdown code fences."
         )
         text = ""
+        first_token = True
 
         def on_chunk(t: str) -> None:
-            nonlocal text
+            nonlocal text, first_token
+            if first_token:
+                trace("STEP_FIRST_TOKEN", f"step={step.number} keyword=GENCODE")
+                first_token = False
             text += t
             if self._renderer:
                 self._renderer.stream_chunk(t)
 
+        trace("STEP_LLM_REQUEST", f"step={step.number} keyword=GENCODE lang={language} save={save_path}")
         raw = self._collect_text(
             [{"role": "user", "content": instructions}],
             system_prompt=system,
@@ -249,6 +263,7 @@ class Orchestrator:
         )
         if self._renderer:
             self._renderer.finalize()
+        trace("STEP_LLM_DONE", f"step={step.number} keyword=GENCODE response_len={len(raw)}")
 
         code = _strip_code_fences(raw)
         req = ActionRequest(
@@ -285,12 +300,15 @@ class Orchestrator:
                 "Those steps will fail. Re-run with --allow-exec to enable execution."
             )
 
+        trace("PLAN_EXEC_START", f"total_steps={total}")
         for step in steps:
             self._info(f"\n[{step.number}/{total}] {step.keyword}: {step.arg[:70]}")
+            trace("STEP_START", f"step={step.number}/{total} keyword={step.keyword} arg={step.arg[:60]!r}")
 
             if self._dry_run:
                 self._info("  [dry-run] skipped")
                 store.store(step.number, f"[dry-run placeholder for step {step.number}]")
+                trace("STEP_SKIPPED", f"step={step.number} reason=dry_run")
                 continue
 
             needs_confirm = step.keyword in ("WRITEFILE", "EXEC", "GENCODE")
@@ -299,6 +317,7 @@ class Orchestrator:
                 if not self._confirm(f"  Allow {step.keyword} ({label})?"):
                     self._info("  Skipped by user.")
                     store.store(step.number, "[skipped by user]")
+                    trace("STEP_SKIPPED", f"step={step.number} reason=user_denied")
                     continue
 
             result: StepResult
@@ -326,9 +345,11 @@ class Orchestrator:
                 store.store(step.number, result.output)
                 if step.keyword == "PROMPT":
                     final_output = result.output
+                trace("STEP_DONE", f"step={step.number} keyword={step.keyword} success=True output_len={len(result.output)}")
             else:
                 self._error(f"  ✗ {result.error}")
-                store.store(step.number, f"[Step {step.number} failed: {result.error}]")
+                store.store_failure(step.number, f"[Step {step.number} failed: {result.error}]")
+                trace("STEP_DONE", f"step={step.number} keyword={step.keyword} success=False error={result.error!r}")
                 if self._on_error == "abort":
                     self._error("Aborting plan execution after step failure.")
                     return final_output
