@@ -14,20 +14,25 @@ from dataclasses import dataclass
 
 KEYWORDS = frozenset(["READFILE", "WRITEFILE", "LISTDIR", "EXEC", "PROMPT", "GENCODE"])
 
-# Match: optional "Step N:" / "N." / "N)" bullet / "- " list marker, then KEYWORD
+# Match: optional "##" heading / "Step N:" / "N." / "N)" bullet / "- " list marker, then KEYWORD
 # The separator (": " or " ") is optional to handle bare "KEYWORD" lines.
 # Also handles "[KEYWORD]" bracket format used by some models.
 _STEP_RE = re.compile(
     r"^\s*"
+    r"(?:#+\s*)?"                    # optional "##" markdown heading prefix
     r"(?:step\s*\d+\s*[.:)]\s*)?"   # optional "Step N:" prefix
     r"(?:\d+\s*[.)]\s*)?"            # optional "1." or "1)" bullet
     r"(?:[-*]\s+)?"                  # optional "- " or "* " markdown list marker
     r"(?:\[)?"                       # optional opening "[" (e.g. "[READFILE]")
     r"(" + "|".join(KEYWORDS) + r")"
-    r"(?:\])?"                       # optional closing "]"
+    r"(?:\]|`)?"                     # optional closing "]" or "`" (e.g. "[READFILE]" or "`READFILE`")
     r"\s*[: ]?\s*(.*)",              # separator is optional
     re.IGNORECASE,
 )
+
+# Strips a backtick that wraps only the keyword inside a list item, e.g. "* `KEYWORD`"
+# After the outer strip("`") call removes a trailing backtick, this removes the inner one.
+_LIST_BACKTICK_RE = re.compile(r"^([-*]\s+)`")
 
 # SAVEAS (and common aliases) within a GENCODE block
 _SAVEAS_RE = re.compile(
@@ -79,7 +84,7 @@ def _normalize_readfile_arg(arg: str) -> str:
     m = _PATH_RE.match(arg)
     if m:
         return f"cat {m.group(1).strip()}"
-    a = arg.strip()
+    a = arg.strip().strip("\"'")  # strip surrounding quotes that some models add
     if (a.startswith("/") or a.startswith("~")) and " " not in a:
         return f"cat {a}"
     return arg
@@ -98,7 +103,7 @@ def _normalize_listdir_arg(arg: str) -> str:
     m = _PATH_RE.match(arg.strip())
     if m:
         return m.group(1).strip()
-    return arg
+    return arg.strip().strip("\"'")  # strip surrounding quotes that some models add
 
 
 def _extract_saveas(body_lines: list[str]) -> tuple[str, list[str]]:
@@ -139,8 +144,18 @@ def _make_step(number: int, keyword: str, arg: str, body_lines: list[str]) -> Pl
             if m:
                 arg = m.group(1).strip()
             else:
-                # Strip surrounding quotes that some models add: "/tmp/out.md" → /tmp/out.md
-                arg = arg.strip().strip("\"'")
+                a = arg.strip().strip("\"'")
+                if (a.startswith("/") or a.startswith("~")) and " " in a:
+                    # Model embedded content after the path: "WRITEFILE: /path "content here""
+                    # Extract the path and move the trailing content into the body.
+                    first_space = a.index(" ")
+                    path_part = a[:first_space]
+                    inline = a[first_space:].strip().strip("\"'")
+                    arg = path_part
+                    if inline and not body.strip():
+                        body = inline.replace("\\n", "\n").replace("\\t", "\t")
+                else:
+                    arg = a
 
         case "GENCODE":
             # Try SAVEAS from body first
@@ -182,8 +197,9 @@ def parse_plan(text: str) -> list[PlanStep]:
     step_num = 0
 
     for raw_line in text.splitlines():
-        # Strip inline backtick wrappers that some models add around step lines.
-        line = raw_line.strip("`").strip()
+        # Strip backtick wrappers.  strip("`") handles the whole-line case (`READFILE ...`).
+        # _LIST_BACKTICK_RE handles the inside-list-item case: * `READFILE` → * READFILE
+        line = _LIST_BACKTICK_RE.sub(r"\1", raw_line.strip("`").strip())
         m = _STEP_RE.match(line)
         if m:
             if current_kw is not None:

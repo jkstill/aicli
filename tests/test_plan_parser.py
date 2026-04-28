@@ -332,3 +332,72 @@ def test_writefile_result_ref_in_body():
     plan = "WRITEFILE: /tmp/out.md\n{RESULT_OF_STEP_2}\n"
     steps = parse_plan(plan)
     assert "{RESULT_OF_STEP_2}" in steps[0].body
+
+
+# ---------------------------------------------------------------------------
+# New format tolerance — fixes from 2026-04-28 model compatibility run
+# ---------------------------------------------------------------------------
+
+def test_markdown_heading_prefix_step():
+    """## Step N: KEYWORD format (qwen2.5-coder:14b style)."""
+    plan = "## Step 1: READFILE\ncat /tmp/foo.txt\n## Step 2: WRITEFILE\n/tmp/out.md"
+    steps = parse_plan(plan)
+    assert len(steps) == 2
+    assert steps[0].keyword == "READFILE"
+    assert steps[1].keyword == "WRITEFILE"
+
+
+def test_hash_heading_without_step_prefix():
+    """# KEYWORD and ## KEYWORD headings (no 'Step N' text)."""
+    plan = "# PROMPT\nAnalyze this.\n# WRITEFILE\n/tmp/out.md"
+    steps = parse_plan(plan)
+    assert len(steps) == 2
+    assert steps[0].keyword == "PROMPT"
+    assert steps[1].keyword == "WRITEFILE"
+
+
+def test_backtick_keyword_inside_list_item():
+    """* `GENCODE` format (glm-4.7-flash:q4_K_M style)."""
+    plan = "* `PROMPT`: Write a story.\n* `WRITEFILE` /tmp/story.md"
+    steps = parse_plan(plan)
+    assert len(steps) == 2
+    assert steps[0].keyword == "PROMPT"
+    assert steps[1].keyword == "WRITEFILE"
+    assert steps[1].arg == "/tmp/story.md"
+
+
+def test_writefile_inline_content_moved_to_body():
+    """WRITEFILE: /path "inline content" — content must move to body (qwen3.5:latest style)."""
+    plan = 'WRITEFILE: /tmp/out.md "# My Report\\nSome content here."'
+    steps = parse_plan(plan)
+    assert steps[0].arg == "/tmp/out.md"
+    assert "My Report" in steps[0].body
+    assert "Some content here." in steps[0].body
+
+
+def test_writefile_inline_content_newline_unescaped():
+    """\\n escape sequences in inline content are expanded to real newlines."""
+    plan = 'WRITEFILE: /tmp/out.md "line one\\nline two"'
+    steps = parse_plan(plan)
+    assert steps[0].arg == "/tmp/out.md"
+    assert "\n" in steps[0].body
+
+
+def test_writefile_inline_content_not_moved_when_body_present():
+    """If body lines already exist, inline arg content is discarded."""
+    plan = 'WRITEFILE: /tmp/out.md "ignored inline"\nactual body line'
+    steps = parse_plan(plan)
+    assert steps[0].arg == "/tmp/out.md"
+    assert steps[0].body == "actual body line"
+
+
+def test_listdir_quoted_path_stripped():
+    """LISTDIR: "/tmp" — surrounding quotes stripped (qwen3.5:9b style)."""
+    steps = parse_plan('LISTDIR: "/tmp"')
+    assert steps[0].arg == "/tmp"
+
+
+def test_readfile_quoted_path_normalized():
+    """READFILE: "/tmp/foo.txt" — quotes stripped, normalized to cat command."""
+    steps = parse_plan('READFILE: "/tmp/foo.txt"')
+    assert steps[0].arg == "cat /tmp/foo.txt"

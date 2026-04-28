@@ -6,6 +6,7 @@ falls back to system-prompt action block parsing.
 """
 
 import json
+import time
 from typing import Generator
 
 import httpx
@@ -136,45 +137,68 @@ class OllamaDriver(BaseDriver):
         native_tool_calls: list[NativeToolCall] = []
         tokens_in = tokens_out = 0
         first_chunk = True
+        # Track time of last received TEXT token.  Thinking models keep the network
+        # connection alive with empty keepalive chunks, so httpx's read timeout never
+        # fires.  We enforce our own silence timeout at the application level.
+        last_text_time = time.monotonic()
+        timed_out = False
 
-        # connect=10s, read=configurable (thinking models can be silent for minutes)
-        timeout = httpx.Timeout(connect=10.0, read=self._stream_read_timeout, write=10.0, pool=10.0)
-        trace("STREAM_CONNECT", f"model={self._model} read_timeout={self._stream_read_timeout}s")
+        # connect=10s, read=30s (just for network drops; text silence handled below)
+        timeout = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=10.0)
+        trace("STREAM_CONNECT", f"model={self._model} silence_timeout={self._stream_read_timeout}s")
 
-        with httpx.Client(timeout=timeout) as client:
-            with client.stream("POST", f"{self._base}{_CHAT_PATH}", json=body) as resp:
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    if not raw_line.strip():
-                        continue
-                    try:
-                        chunk = json.loads(raw_line)
-                    except json.JSONDecodeError:
-                        continue
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                with client.stream("POST", f"{self._base}{_CHAT_PATH}", json=body) as resp:
+                    resp.raise_for_status()
+                    for raw_line in resp.iter_lines():
+                        if not raw_line.strip():
+                            continue
+                        try:
+                            chunk = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
 
-                    message = chunk.get("message", {})
-                    content = message.get("content", "")
-                    tool_calls = message.get("tool_calls", [])
+                        message = chunk.get("message", {})
+                        content = message.get("content", "")
+                        tool_calls = message.get("tool_calls", [])
 
-                    if content:
-                        if first_chunk:
-                            trace("STREAM_FIRST_CHUNK", f"model={self._model}")
-                            first_chunk = False
-                        yield ResponseChunk(text=content)
+                        if content:
+                            last_text_time = time.monotonic()
+                            if first_chunk:
+                                trace("STREAM_FIRST_CHUNK", f"model={self._model}")
+                                first_chunk = False
+                            yield ResponseChunk(text=content)
+                        elif self._stream_read_timeout > 0:
+                            # No text in this chunk (keepalive/thinking).  Check silence.
+                            elapsed = time.monotonic() - last_text_time
+                            if elapsed > self._stream_read_timeout:
+                                trace("STREAM_SILENCE_TIMEOUT",
+                                      f"model={self._model} elapsed={elapsed:.0f}s")
+                                timed_out = True
+                                break
 
-                    for tc in tool_calls:
-                        fn = tc.get("function", {})
-                        native_tool_calls.append(
-                            NativeToolCall(
-                                name=fn.get("name", ""),
-                                params=fn.get("arguments", {}),
+                        for tc in tool_calls:
+                            fn = tc.get("function", {})
+                            native_tool_calls.append(
+                                NativeToolCall(
+                                    name=fn.get("name", ""),
+                                    params=fn.get("arguments", {}),
+                                )
                             )
-                        )
 
-                    if chunk.get("done"):
-                        tokens_in = chunk.get("prompt_eval_count", 0)
-                        tokens_out = chunk.get("eval_count", 0)
-                        trace("STREAM_DONE", f"model={self._model} tokens_in={tokens_in} tokens_out={tokens_out}")
+                        if chunk.get("done"):
+                            tokens_in = chunk.get("prompt_eval_count", 0)
+                            tokens_out = chunk.get("eval_count", 0)
+                            trace("STREAM_DONE",
+                                  f"model={self._model} tokens_in={tokens_in} tokens_out={tokens_out}")
+
+        except (httpx.ReadTimeout, httpx.TimeoutException) as e:
+            trace("STREAM_NETWORK_TIMEOUT", f"model={self._model} error={e}")
+            timed_out = True
+
+        if timed_out:
+            trace("STREAM_ABORTED", f"model={self._model}")
 
         yield ResponseChunk(
             done=True,

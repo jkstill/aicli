@@ -22,7 +22,8 @@ for model in $(aicli --list-models); do
 	tmpPrompt="${prompt//<<RESPONSE_FILE>>/$reponseFilename}"
 	echo "Prompt: $tmpPrompt"
 	echo "start time: $(date +%Y-%m-%d\ %H:%M:%S)"
-	time echo $tmpPrompt | aicli --model $model  --include-directories /tmp  --auto-approve --allow-exec
+	traceFile=$logDir/trace-$(date +%Y-%m-%d_%H-%M-%S).log && > $traceFile
+	time echo $tmpPrompt | aicli --trace $traceFile --stream-timeout 120 --model $model  --include-directories /tmp  --auto-approve --allow-exec
 	echo "  end time: $(date +%Y-%m-%d\ %H:%M:%S)"
 	echo "=============================="
 done

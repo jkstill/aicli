@@ -15,7 +15,7 @@ from typing import TextIO
 class Tracer:
     def __init__(self, path: str) -> None:
         self._start = time.monotonic()
-        self._file: TextIO = open(path, "w", buffering=1)  # line-buffered
+        self._file: TextIO = open(path, "a", buffering=1)  # append, line-buffered
         self._write("TRACE_START", f"pid={os.getpid()} file={path}")
 
     def _write(self, event: str, message: str) -> None:
