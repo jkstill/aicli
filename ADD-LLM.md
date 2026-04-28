@@ -1,8 +1,8 @@
 # Adding a New LLM Driver to aicli
 
-This guide walks through the full process of adding a new vendor driver —
-from writing the driver class to registering it, wiring up config, and
-running tests. It uses a hypothetical `myprovider` driver as a running example.
+This guide walks through adding a new vendor driver — from the driver class to
+registration, config, and tests. It uses a hypothetical `myprovider` driver as
+a running example.
 
 See [API.md](API.md) for the full internal API reference.
 
@@ -20,8 +20,7 @@ See [API.md](API.md) for the full internal API reference.
 - [Step 7 — Add config support](#step-7--add-config-support)
 - [Step 8 — Write tests](#step-8--write-tests)
 - [Step 9 — Smoke test](#step-9--smoke-test)
-- [Native Tool Calling](#native-tool-calling)
-- [System Prompt Fallback](#system-prompt-fallback)
+- [The `use_tools` parameter](#the-use_tools-parameter)
 - [Model-Specific Quirks](#model-specific-quirks)
 - [Checklist](#checklist)
 
@@ -30,16 +29,18 @@ See [API.md](API.md) for the full internal API reference.
 ## Overview
 
 The driver layer is the only place where vendor-specific API details live.
-Everything above (action parsing, permission enforcement, session history,
+Everything above (plan parsing, permission enforcement, step execution,
 rendering) is vendor-agnostic.
 
-A driver's job is exactly two things:
+In V2, a driver's job is exactly two things:
 
 1. Accept a list of chat messages + a system prompt and stream back
    `ResponseChunk` objects.
-2. Optionally expose native tool/function-calling if the API supports it.
+2. Respect `use_tools=False` when called by the planner/orchestrator (V2 does
+   not use native tool calling — the LLM produces plain-text step plans).
 
-The rest is handled by aicli's core.
+Native tool calling support is retained for any future V1-compatible use cases,
+but it is not exercised by the current V2 planner/executor pipeline.
 
 ---
 
@@ -60,7 +61,7 @@ class MyProviderDriver(BaseDriver):
     def configure(self, api_base, api_key, model, options=None):
         raise NotImplementedError
 
-    def send(self, messages, system_prompt="", stream=True):
+    def send(self, messages, system_prompt="", stream=True, use_tools=True):
         raise NotImplementedError
         yield  # make it a generator
 
@@ -75,8 +76,8 @@ class MyProviderDriver(BaseDriver):
 
 ## Step 2 — Implement `configure()`
 
-`configure()` is called once before any `send()` call. Store everything you
-need to make API requests.
+`configure()` is called once before any `send()`. Store everything needed to
+make API requests.
 
 ```python
 class MyProviderDriver(BaseDriver):
@@ -100,19 +101,28 @@ class MyProviderDriver(BaseDriver):
         self._options = options or {}
 ```
 
-The `options` dict is passed through from `config.yaml` under
-`drivers.myprovider.options`. Use it for model-specific tuning (e.g.
-`temperature`, `think`, `max_tokens`).
+The `options` dict passes through from `config.yaml` under
+`drivers.myprovider.options`. Use it for model-specific tuning (temperature,
+max_tokens, etc.).
 
 ---
 
 ## Step 3 — Implement `supports_native_tools()`
 
-Decide whether your driver will use native tool/function calling.
+In V2, this method is not used during normal operation — the planner and
+orchestrator always pass `use_tools=False`. Implement it for completeness
+and potential future use.
 
-### Option A — Native tools supported
+### Option A — Always false
 
-If the API supports OpenAI-style function calling, return `True` and also
+```python
+def supports_native_tools(self) -> bool:
+    return False
+```
+
+### Option B — Declare support (not used in V2 planner mode)
+
+If the API supports OpenAI-style function calling, return `True` and
 implement `get_native_tool_schema()`:
 
 ```python
@@ -125,22 +135,7 @@ def get_native_tool_schema(self) -> list[dict] | None:
     return NATIVE_TOOL_SCHEMAS
 ```
 
-`NATIVE_TOOL_SCHEMAS` is a list of five JSON Schema function definitions
-(read_file, write_file, list_directory, execute, search_files). Most
-OpenAI-compatible APIs accept this format directly. See
-`src/aicli/core/actions.py` for the full schema.
-
-### Option B — No native tools
-
-Return `False`. aicli will inject `ACTION_SYSTEM_PROMPT` into the system
-prompt, which teaches the model the `<aicli_action>` XML block format.
-
-```python
-def supports_native_tools(self) -> bool:
-    return False
-```
-
-### Option C — Detect at runtime (recommended for Ollama-style APIs)
+### Option C — Runtime detection
 
 Query the model's capabilities and cache the result:
 
@@ -149,10 +144,6 @@ def supports_native_tools(self) -> bool:
     if not hasattr(self, "_tools_supported"):
         self._tools_supported = self._check_capability()
     return self._tools_supported
-
-def _check_capability(self) -> bool:
-    # Query your API for model info and check for tool support
-    ...
 ```
 
 ---
@@ -163,15 +154,16 @@ def _check_capability(self) -> bool:
 
 - Yield `ResponseChunk(text=..., done=False)` for each streamed text segment.
 - Yield exactly one `ResponseChunk(done=True, ...)` as the final chunk.
-- Populate `native_tool_calls` on the done chunk when native tools are used.
+- Respect `use_tools=False` by omitting tool schemas from the request.
 
-### Minimal streaming example (REST API)
+### Minimal streaming example
 
 ```python
 import json
 import httpx
 from ..core.actions import NATIVE_TOOL_SCHEMAS
 from .base import BaseDriver, NativeToolCall, ResponseChunk
+
 
 class MyProviderDriver(BaseDriver):
 
@@ -180,6 +172,7 @@ class MyProviderDriver(BaseDriver):
         messages: list[dict],
         system_prompt: str = "",
         stream: bool = True,
+        use_tools: bool = True,
     ) -> Generator[ResponseChunk, None, None]:
         headers = {
             "Authorization": f"Bearer {self._api_key}",
@@ -190,7 +183,9 @@ class MyProviderDriver(BaseDriver):
             "messages": self._build_messages(messages, system_prompt),
             "stream": stream,
         }
-        if self.supports_native_tools():
+
+        # Only add tools when use_tools=True (V2 planner always passes False)
+        if use_tools and self.supports_native_tools():
             body["tools"] = NATIVE_TOOL_SCHEMAS
             body["tool_choice"] = "required"
 
@@ -200,7 +195,6 @@ class MyProviderDriver(BaseDriver):
             yield from self._no_stream(headers, body)
 
     def _build_messages(self, messages, system_prompt):
-        """Convert aicli messages to provider format."""
         result = []
         if system_prompt:
             result.append({"role": "system", "content": system_prompt})
@@ -208,7 +202,7 @@ class MyProviderDriver(BaseDriver):
         return result
 ```
 
-### Streaming loop
+### Streaming loop (OpenAI-compatible SSE)
 
 ```python
     def _stream(self, headers, body):
@@ -234,22 +228,19 @@ class MyProviderDriver(BaseDriver):
                     except json.JSONDecodeError:
                         continue
 
-                    # Extract text delta
                     delta = chunk.get("choices", [{}])[0].get("delta", {})
                     text = delta.get("content") or ""
                     if text:
                         yield ResponseChunk(text=text)
 
-                    # Extract tool calls (OpenAI format)
                     for tc in delta.get("tool_calls", []):
                         fn = tc.get("function", {})
                         tool_calls.append(NativeToolCall(
                             name=fn.get("name", ""),
-                            params=fn.get("arguments", {}),
+                            params=self._parse_args(fn.get("arguments", {})),
                             call_id=tc.get("id", ""),
                         ))
 
-                    # Usage (may appear on any chunk or the last one)
                     if "usage" in chunk:
                         tokens_in = chunk["usage"].get("prompt_tokens", 0)
                         tokens_out = chunk["usage"].get("completion_tokens", 0)
@@ -261,6 +252,18 @@ class MyProviderDriver(BaseDriver):
             tokens_out=tokens_out,
             model=self._model,
         )
+
+    def _parse_args(self, raw) -> dict:
+        """Handle arguments as dict or JSON-encoded string."""
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                import json as _json
+                return _json.loads(raw)
+            except Exception:
+                return {}
+        return {}
 ```
 
 ### Non-streaming fallback
@@ -285,7 +288,7 @@ class MyProviderDriver(BaseDriver):
         tool_calls = [
             NativeToolCall(
                 name=tc.get("function", {}).get("name", ""),
-                params=tc.get("function", {}).get("arguments", {}),
+                params=self._parse_args(tc.get("function", {}).get("arguments", {})),
                 call_id=tc.get("id", ""),
             )
             for tc in tool_calls_raw
@@ -302,32 +305,9 @@ class MyProviderDriver(BaseDriver):
         )
 ```
 
-### Tool call argument parsing
-
-Some APIs return `arguments` as a JSON-encoded string rather than a dict.
-Handle both:
-
-```python
-import json as json_module
-
-def _parse_arguments(raw) -> dict:
-    if isinstance(raw, dict):
-        return raw
-    if isinstance(raw, str):
-        try:
-            return json_module.loads(raw)
-        except json_module.JSONDecodeError:
-            return {}
-    return {}
-```
-
-Use `_parse_arguments(fn.get("arguments", {}))` when building `NativeToolCall`.
-
 ---
 
 ## Step 5 — Implement `list_models()`
-
-Return a list of model name strings. Users see this output from `--list-models`.
 
 ```python
 def list_models(self) -> list[str]:
@@ -339,11 +319,11 @@ def list_models(self) -> list[str]:
     return sorted(m["id"] for m in data.get("data", []))
 ```
 
-If the API does not have a model-listing endpoint, return a hardcoded list:
+If the API has no model-listing endpoint, return a hardcoded list:
 
 ```python
 def list_models(self) -> list[str]:
-    return ["myprovider-model-v1", "myprovider-model-v2"]
+    return ["myprovider-fast", "myprovider-large"]
 ```
 
 ---
@@ -364,7 +344,7 @@ _REGISTRY: dict[str, type[BaseDriver]] = {
 }
 ```
 
-The key (`"myprovider"`) is what users write before the `/` in `--model`:
+The registry key is the driver prefix in `--model`:
 
 ```bash
 aicli --model myprovider/model-name-v1
@@ -374,7 +354,7 @@ aicli --model myprovider/model-name-v1
 
 ## Step 7 — Add config support
 
-Add a default config entry in `src/aicli/config.py` under `_DEFAULTS`:
+Add a default entry in `src/aicli/config.py` under `_DEFAULTS["drivers"]`:
 
 ```python
 _DEFAULTS = {
@@ -384,24 +364,23 @@ _DEFAULTS = {
         "gemini":     {"api_key_env": "GEMINI_API_KEY"},
         "claude":     {"api_key_env": "ANTHROPIC_API_KEY"},
         "openai":     {"api_key_env": "OPENAI_API_KEY"},
-        "myprovider": {"api_key_env": "MYPROVIDER_API_KEY"},   # ← add this
+        "myprovider": {"api_key_env": "MYPROVIDER_API_KEY"},   # ← add
     },
 }
 ```
 
-Users can then set their API key with:
+Users set the key:
 
 ```bash
 export MYPROVIDER_API_KEY="sk-..."
 ```
 
-Or add it to `~/.config/aicli/config.yaml`:
+Or in `~/.config/aicli/config.yaml`:
 
 ```yaml
 drivers:
   myprovider:
-    api_key_env: MYPROVIDER_API_KEY   # read from environment
-    # api_key: sk-literal-value       # or hardcode (not recommended)
+    api_key_env: MYPROVIDER_API_KEY
     api_base: https://api.myprovider.example/v1
     options:
       temperature: 0.2
@@ -411,24 +390,17 @@ drivers:
 
 ## Step 8 — Write tests
 
-Create `tests/test_drivers/test_myprovider.py`. At minimum test:
-
-1. **`list_models()`** — returns a non-empty list of strings.
-2. **`supports_native_tools()`** — returns a bool.
-3. **`send()` streaming** — yields at least one text chunk and exactly one done chunk.
-4. **System prompt injection** — the system prompt appears in the outgoing request.
-
-### Example test file
+Create `tests/test_drivers/test_myprovider.py`:
 
 ```python
-"""Integration tests for the MyProvider driver — requires API credentials."""
+"""Integration tests — require API credentials (skipped otherwise)."""
 
 import os
 import pytest
 from aicli.drivers.myprovider import MyProviderDriver
 
 API_KEY = os.environ.get("MYPROVIDER_API_KEY", "")
-TEST_MODEL = "myprovider-model-v1"
+TEST_MODEL = "myprovider-fast"
 
 
 @pytest.fixture(scope="module")
@@ -442,200 +414,156 @@ def driver():
 
 def test_list_models(driver):
     models = driver.list_models()
-    assert isinstance(models, list)
-    assert len(models) > 0
-    assert all(isinstance(m, str) for m in models)
+    assert isinstance(models, list) and len(models) > 0
 
 
-def test_supports_native_tools_returns_bool(driver):
-    result = driver.supports_native_tools()
-    assert isinstance(result, bool)
+def test_supports_native_tools(driver):
+    assert isinstance(driver.supports_native_tools(), bool)
 
 
 def test_simple_stream(driver):
     messages = [{"role": "user", "content": "Reply with just: PONG"}]
     chunks = []
     done_chunk = None
-    for chunk in driver.send(messages, stream=True):
+    for chunk in driver.send(messages, stream=True, use_tools=False):
         if chunk.done:
             done_chunk = chunk
         else:
             chunks.append(chunk.text)
-
-    full_text = "".join(chunks)
-    assert len(full_text) > 0
-    assert done_chunk is not None
-    assert done_chunk.done is True
+    assert "".join(chunks).strip()
+    assert done_chunk is not None and done_chunk.done
 
 
-def test_system_prompt_applied(driver):
+def test_use_tools_false_sends_no_schema(driver):
+    """Verify use_tools=False produces a plain text response (no tool calls)."""
     messages = [{"role": "user", "content": "What is 2+2?"}]
-    system = "Always respond with only the number, no words."
-    chunks = []
-    for chunk in driver.send(messages, system_prompt=system, stream=True):
-        if not chunk.done:
-            chunks.append(chunk.text)
-    full_text = "".join(chunks)
-    assert len(full_text) > 0
-
-
-def test_native_tool_write_file(driver):
-    """Only run if the driver declares native tool support."""
-    if not driver.supports_native_tools():
-        pytest.skip("Native tools not supported by this driver")
-
-    messages = [{"role": "user", "content": "Write Hello to /tmp/test.txt"}]
-    chunks = []
     done_chunk = None
-    for chunk in driver.send(messages, stream=True):
+    for chunk in driver.send(messages, stream=True, use_tools=False):
         if chunk.done:
             done_chunk = chunk
-        else:
-            chunks.append(chunk.text)
-
     assert done_chunk is not None
-    assert isinstance(done_chunk.native_tool_calls, list)
-    # The model should have called write_file (or a recognisable variant)
-    if done_chunk.native_tool_calls:
-        tc = done_chunk.native_tool_calls[0]
-        assert tc.name or tc.params  # at minimum something was returned
-```
+    # With use_tools=False, no tool calls should be returned
+    assert done_chunk.native_tool_calls == []
 
-### Running the tests
 
-```bash
-# All tests (unit + integration)
-python3.11 -m pytest tests/ -v
-
-# Just the new driver (skips automatically if no API key)
-python3.11 -m pytest tests/test_drivers/test_myprovider.py -v
-
-# Unit tests only — no external calls
-python3.11 -m pytest tests/test_parser.py tests/test_executor.py tests/test_permissions.py -v
+def test_v2_planner_call(driver):
+    """Simulate what the V2 Planner does: plain text response expected."""
+    from aicli.core.planner import load_system_prompt
+    sp = load_system_prompt()
+    messages = [{"role": "user", "content":
+        "Produce a step plan using ONLY step blocks. No prose.\n\n"
+        "TASK: Read /tmp/test.txt and write a summary to /tmp/summary.md"}]
+    text = ""
+    for chunk in driver.send(messages, system_prompt=sp, stream=True, use_tools=False):
+        if not chunk.done:
+            text += chunk.text
+    # Should contain at least one recognized keyword
+    from aicli.core.plan_parser import KEYWORDS
+    assert any(kw in text.upper() for kw in KEYWORDS), \
+        f"Expected a plan with step keywords; got: {text[:200]}"
 ```
 
 ---
 
 ## Step 9 — Smoke test
 
-Once the driver is registered and configured, test it end-to-end:
-
 ```bash
-# Confirm the driver is recognised and can list models
+# Verify the driver is registered and can list models
 aicli --model myprovider --list-models
 
 # Basic question (no file ops)
 echo "What is the capital of France?" | \
-  aicli --model myprovider/myprovider-model-v1 --no-markdown
+  aicli --model myprovider/myprovider-fast --no-markdown
 
-# Agentic write (requires a model with tool support)
-echo "Write Hello World to /tmp/myprovider_test.txt" | \
-  aicli --model myprovider/myprovider-model-v1 \
+# Dry-run: see the plan the model produces
+echo "Read /tmp/test.txt and summarize it to /tmp/summary.md" | \
+  aicli --model myprovider/myprovider-fast \
+        --include-directories /tmp \
+        --dry-run
+
+# Full execution
+echo "Read /tmp/test.txt and summarize it to /tmp/summary.md" | \
+  aicli --model myprovider/myprovider-fast \
         --include-directories /tmp \
         --auto-approve
-cat /tmp/myprovider_test.txt
 ```
 
 ---
 
-## Native Tool Calling
+## The `use_tools` parameter
 
-### How aicli uses tools
+In V2, all LLM calls go through `driver.send(..., use_tools=False)`. This tells
+the driver not to include native tool schemas in the request body. The model
+receives only the system prompt and messages, and responds with plain text (the
+step plan, or the PROMPT/GENCODE response).
 
-When `driver.supports_native_tools()` returns `True`:
+**Drivers MUST respect this flag.** If `use_tools=False`, omit `"tools"` and
+`"tool_choice"` from the request entirely, even if `supports_native_tools()`
+returns `True`.
 
-1. `NATIVE_TOOL_SCHEMAS` is added to the request body as `tools`.
-2. `tool_choice: "required"` is added to force the model to call a tool.
-3. The system prompt is the short `NATIVE_TOOLS_HINT` (not the XML action format).
-4. After streaming, the done chunk's `native_tool_calls` list is processed
-   by `_native_call_to_action_request()` in `cli.py`.
-
-The tool schemas use standard JSON Schema / OpenAI function format and are
-accepted by most APIs without modification.
-
-### Parameter name normalization
-
-Models often return parameter names that differ from the schema
-(`file_path` instead of `path`, `cmd` instead of `command`, etc.).
-aicli normalizes these automatically via `_PARAM_ALIASES` in `cli.py`.
-If your model uses unusual parameter names consistently, add them there.
-
-### Function name inference
-
-If a model returns an empty function name or a non-standard one
-(e.g. `"fs.writeFile"`, `"create_file"`, `"function5"`), aicli's
-`_infer_action_type()` uses fuzzy name matching and argument-key
-heuristics to determine the intended action. You do not need to handle
-this in the driver — return whatever the API gives you.
-
----
-
-## System Prompt Fallback
-
-When `supports_native_tools()` returns `False`, aicli automatically injects
-`ACTION_SYSTEM_PROMPT` which teaches the model the `<aicli_action>` XML format.
-
-This approach works with any model that can follow formatting instructions, but
-reliability varies. Models with heavy RLHF training against file operations (e.g.
-most qwen3.x variants) may ignore the format and respond with plain text instead.
-
-To improve reliability for a system-prompt-only model:
-
-- Use a stronger, more directive system prompt (see `system_prompt.py`).
-- Include few-shot examples in the `--system-prompt-file`.
-- Consider whether the model's native tool calling (if any) is preferable.
+```python
+def send(self, messages, system_prompt="", stream=True, use_tools=True):
+    body = {
+        "model": self._model,
+        "messages": ...,
+        "stream": stream,
+    }
+    # ← IMPORTANT: only add tools when explicitly requested
+    if use_tools and self.supports_native_tools():
+        body["tools"] = NATIVE_TOOL_SCHEMAS
+        body["tool_choice"] = "required"
+    ...
+```
 
 ---
 
 ## Model-Specific Quirks
 
-Document any quirks about your provider's models in this section when you
-discover them during testing. Here are the patterns found in the existing drivers:
+Document model quirks when you discover them. Known patterns:
 
-### Thinking models (qwen3, glm4)
+### Thinking models
 
-Models with a `thinking` capability (Ollama's internal extended reasoning) will
-reason their way into RLHF-driven refusals for file operations when thinking mode
-is on. The Ollama driver disables thinking (`options.think = false`) automatically
-for these models when native tools are active.
-
-If your provider has a similar reasoning/thinking mode, check whether disabling
-it improves tool call reliability.
-
-### Empty function names
-
-The `batiai/qwen3.6-35b` model consistently returns empty string as the function
-name in tool calls. aicli handles this through argument-key heuristics. If your
-model does the same, no driver change is needed — the core layer handles it.
+Models with extended reasoning modes (chain-of-thought, thinking tokens) may
+re-activate RLHF refusals for file operations when thinking mode is on. The
+Ollama driver disables thinking (`options.think = false`) automatically for
+such models. If your provider has a similar mode, consider disabling it when
+`use_tools=False` (planner mode) to get cleaner plain-text responses.
 
 ### Arguments as JSON strings
 
-OpenAI's streaming API returns `function.arguments` as a JSON-encoded string
-rather than a parsed dict. Parse it with `json.loads()` before building
-`NativeToolCall`. Non-streaming responses may return a dict directly.
+OpenAI's streaming API returns `function.arguments` as a JSON-encoded string.
+Non-streaming responses may return a dict. Handle both with `_parse_args()`.
 
-### Thinking tokens in streaming output
+### Empty function names
 
-Some models interleave `<think>...</think>` tokens in their text output. These
-appear in streamed `ResponseChunk.text` and will be rendered to the user's terminal.
-If you want to suppress them, strip them in `_stream()` before yielding chunks.
+Some models return empty string for the function name. aicli's core handles
+this through argument-key heuristics (`_infer_action_type` in `cli.py`).
+
+### Models ignoring system prompts
+
+Some models are fine-tuned to override system prompt constraints with
+"helpful" responses. If the plan parser returns no steps (the warning
+"No plan steps found" appears), the model is not following the planner format.
+
+Workarounds:
+- Try a different model for the planner role (`--model`).
+- Embed the format instruction in the user message (the Planner class already
+  does this via the "Produce a step plan using ONLY step blocks..." prefix).
+- Use a more directive custom system prompt (`--system-prompt-file`).
 
 ---
 
 ## Checklist
 
-Use this checklist when submitting a new driver:
-
-- [ ] `src/aicli/drivers/myprovider.py` created and implements all four abstract methods
-- [ ] Driver registered in `src/aicli/drivers/registry.py`
-- [ ] Default config entry added in `src/aicli/config.py` (`_DEFAULTS["drivers"]`)
-- [ ] `configure()` sets `api_base`, `api_key`, `model`, and `options`
+- [ ] `src/aicli/drivers/myprovider.py` created, all four abstract methods implemented
+- [ ] `send()` signature includes `use_tools: bool = True` parameter
+- [ ] `send()` only adds tool schemas when `use_tools=True` (not when `False`)
 - [ ] `send()` always yields a terminal `ResponseChunk(done=True)` as the last item
 - [ ] `send()` handles both `stream=True` and `stream=False`
-- [ ] `supports_native_tools()` returns the correct value for the model family
-- [ ] If native tools: `NATIVE_TOOL_SCHEMAS` is passed in the request body
-- [ ] If native tools: `tool_choice: "required"` is set in the request body
-- [ ] `list_models()` returns a non-empty list of strings (or a clear stub)
-- [ ] `tests/test_drivers/test_myprovider.py` written and skips gracefully if no API key
-- [ ] All existing unit tests still pass: `python3.11 -m pytest tests/test_parser.py tests/test_executor.py tests/test_permissions.py`
-- [ ] End-to-end smoke test passes (basic question + file write if native tools)
+- [ ] Driver registered in `src/aicli/drivers/registry.py`
+- [ ] Default config entry added in `src/aicli/config.py`
+- [ ] `tests/test_drivers/test_myprovider.py` written (skips gracefully without credentials)
+- [ ] `test_use_tools_false_sends_no_schema` passes
+- [ ] Existing unit tests still pass: `python -m pytest tests/test_parser.py tests/test_executor.py tests/test_permissions.py`
+- [ ] Dry-run smoke test passes (plan is produced with step keywords)
+- [ ] Full execution smoke test passes (file written to /tmp)
