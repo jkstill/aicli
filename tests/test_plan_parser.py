@@ -276,6 +276,38 @@ def test_gencode_path_as_arg_no_extension():
     assert steps[0].arg == "text"
 
 
+def test_gencode_arrow_path_extraction():
+    """'GENCODE: \" → /tmp/out.py \"desc\"' → save_path extracted from → /path."""
+    steps = parse_plan('GENCODE: " → /tmp/out.py "some description"')
+    assert len(steps) == 1
+    assert steps[0].save_path == "/tmp/out.py"
+
+
+def test_gencode_arrow_path_extraction_ascii():
+    steps = parse_plan("GENCODE: -> /tmp/script.sh Write a script.")
+    assert steps[0].save_path == "/tmp/script.sh"
+
+
+def test_bracket_keyword_format():
+    """[KEYWORD] bracket format used by some models (e.g. glm-4.7-flash)."""
+    plan = "[READFILE]\ncat /tmp/a.txt\n[WRITEFILE]\n/tmp/out.md\nhello\n"
+    steps = parse_plan(plan)
+    # READFILE with empty arg, body has the command
+    assert len(steps) == 2
+    assert steps[0].keyword == "READFILE"
+    assert steps[1].keyword == "WRITEFILE"
+
+
+def test_bare_keyword_no_separator():
+    """Bare 'KEYWORD' with no ':' or space should still be recognized."""
+    plan = "PROMPT\nREADFILE\nWRITEFILE"
+    steps = parse_plan(plan)
+    # PROMPT captures READFILE/WRITEFILE lines as body — bare keywords are ambiguous.
+    # At minimum the first keyword should be found.
+    assert len(steps) >= 1
+    assert steps[0].keyword == "PROMPT"
+
+
 # ---------------------------------------------------------------------------
 # Step numbering
 # ---------------------------------------------------------------------------

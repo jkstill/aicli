@@ -14,14 +14,18 @@ from dataclasses import dataclass
 
 KEYWORDS = frozenset(["READFILE", "WRITEFILE", "LISTDIR", "EXEC", "PROMPT", "GENCODE"])
 
-# Match: optional "Step N:" / "N." / "N)" bullet / "- " list marker, then KEYWORD: rest
+# Match: optional "Step N:" / "N." / "N)" bullet / "- " list marker, then KEYWORD
+# The separator (": " or " ") is optional to handle bare "KEYWORD" lines.
+# Also handles "[KEYWORD]" bracket format used by some models.
 _STEP_RE = re.compile(
     r"^\s*"
     r"(?:step\s*\d+\s*[.:)]\s*)?"   # optional "Step N:" prefix
     r"(?:\d+\s*[.)]\s*)?"            # optional "1." or "1)" bullet
     r"(?:[-*]\s+)?"                  # optional "- " or "* " markdown list marker
+    r"(?:\[)?"                       # optional opening "[" (e.g. "[READFILE]")
     r"(" + "|".join(KEYWORDS) + r")"
-    r"\s*[: ]\s*(.*)",
+    r"(?:\])?"                       # optional closing "]"
+    r"\s*[: ]?\s*(.*)",              # separator is optional
     re.IGNORECASE,
 )
 
@@ -62,6 +66,8 @@ _PATH_RE = re.compile(
 )
 _CMD_RE = re.compile(r'^command\s*=\s*["\']?(.+?)["\']?\s*$', re.IGNORECASE)
 _OUT_RE = re.compile(r'output\s*=\s*["\']?([^"\']+)["\']?', re.IGNORECASE)
+# Matches " → /path" or "-> /path" or "> /path" embedded in a GENCODE arg line.
+_ARROW_PATH_RE = re.compile(r'(?:→|->|>)\s*([/~][^\s"\']+)', re.IGNORECASE)
 _WRITEFILE_PATH_RE = re.compile(
     r'^(?:file|path|filename|filepath|destination|dest)\s*=\s*["\']?([^\s"\']+)["\']?',
     re.IGNORECASE,
@@ -149,10 +155,15 @@ def _make_step(number: int, keyword: str, arg: str, body_lines: list[str]) -> Pl
                 a = arg.strip()
                 if a.startswith("/") or a.startswith("~"):
                     save_path = a
-                    # Infer language from file extension (e.g. ".py" → "python" extension,
-                    # ".md" → "markdown"); fall back to "text".
+                    # Infer language from file extension; fall back to "text".
                     ext = a.rsplit(".", 1)[-1] if "." in a else ""
                     arg = ext if (ext and len(ext) <= 12) else "text"
+            # Fallback: extract a path following "→" or "->" in the arg.
+            # Models sometimes write: GENCODE: " → /path/to/file.py some description"
+            if not save_path:
+                m = _ARROW_PATH_RE.search(arg)
+                if m:
+                    save_path = m.group(1).strip()
 
     return PlanStep(number=number, keyword=keyword, arg=arg, body=body, save_path=save_path)
 
